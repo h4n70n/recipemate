@@ -30,6 +30,10 @@ class Config:
     # AWS
     AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-1")
     S3_BUCKET: str = os.environ.get("S3_BUCKET", "recipemate-images")
+    # Optional CloudFront distribution domain (e.g. "d123.cloudfront.net" or a
+    # custom CNAME). When set, public asset URLs are served from CloudFront;
+    # otherwise they fall back to a direct S3 URL. See app.services.urls.
+    CLOUDFRONT_DOMAIN: str = os.environ.get("CLOUDFRONT_DOMAIN", "")
     SQS_EXTRACTION_QUEUE_URL: str = os.environ.get("SQS_EXTRACTION_QUEUE_URL", "")
     SNS_NOTIFICATIONS_TOPIC_ARN: str = os.environ.get("SNS_NOTIFICATIONS_TOPIC_ARN", "")
 
