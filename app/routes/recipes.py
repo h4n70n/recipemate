@@ -13,10 +13,11 @@ import logging
 
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from app import db
 from app.auth import AuthError, current_user, require_auth
-from app.models.recipe import Recipe
+from app.models.recipe import Recipe, RecipeTag, Tag
 from app.schemas.recipe import (
     ExtractionStatusResponse,
     ExtractRequest,
@@ -27,6 +28,8 @@ from app.schemas.recipe import (
     RecipeListQuery,
     RecipeListResponse,
     RecipeUpdate,
+    TagAddRequest,
+    TagResponse,
     UploadRequest,
     UploadResponse,
 )
@@ -494,6 +497,145 @@ def delete_recipe(recipe_id):
         return error
 
     recipe.deleted_at = datetime.datetime.utcnow()
+    db.session.commit()
+
+    return "", 204
+
+
+def _find_or_create_tag(name: str) -> Tag:
+    """Return the global :class:`Tag` with ``name``, creating it if absent.
+
+    ``tags.name`` is **globally unique** — tags are a shared pool keyed by
+    name, so the same row is reused across every user and recipe that applies
+    that label. "Create the tag if it doesn't exist" therefore means: look the
+    tag up by name and insert one only when none exists yet.
+
+    Concurrency mirrors the user-provisioning path in
+    :func:`app.auth.decorators._provision_user`: two requests can both see "no
+    such tag" and race to insert. The unique constraint settles the tie — the
+    loser catches :class:`~sqlalchemy.exc.IntegrityError`, rolls back, and
+    re-queries to return whichever row the winner committed.
+
+    Args:
+        name: The already-validated/stripped tag name.
+
+    Returns:
+        The existing or newly created :class:`Tag`.
+    """
+    existing = Tag.query.filter_by(name=name).first()
+    if existing is not None:
+        return existing
+
+    tag = Tag(name=name)
+    db.session.add(tag)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent request inserted the same name first. Roll back our
+        # failed insert and return theirs.
+        db.session.rollback()
+        winner = Tag.query.filter_by(name=name).first()
+        if winner is None:
+            # The conflict was not on ``name`` (unexpected) — surface it.
+            raise
+        return winner
+
+    return tag
+
+
+@recipes_bp.post("/<uuid:recipe_id>/tags")
+@require_auth
+def add_tag(recipe_id):
+    """Add a tag to a recipe owned by the caller, creating the tag if needed.
+
+    Implements ``POST /recipes/{id}/tags`` from ``docs/api.md``. The body is
+    ``{"name": "<tag>"}``. The view:
+
+    1. resolves+owns the recipe via :func:`_get_owned_recipe_or_error` (404 for
+       a missing/soft-deleted recipe, 403 for one owned by another user) —
+       identical to the rest of the ``/{id}`` surface,
+    2. validates the body (400 on a missing/empty ``name``, over-long name, or
+       unknown field),
+    3. find-or-creates the **global** tag by name
+       (:func:`_find_or_create_tag`) — because ``tags.name`` is globally
+       unique, an existing tag (even one only used by another user) is reused,
+       so the returned ``id`` is stable across users,
+    4. associates it with the recipe, idempotently.
+
+    Idempotency and status code
+    ----------------------------
+    If the recipe already carries the tag, no duplicate ``recipe_tags`` row is
+    created and the request still succeeds, returning the tag with **200**. A
+    newly created association returns **201**. This lets a client distinguish
+    "I just added it" from "it was already there" while keeping repeat calls
+    safe.
+
+    Returns:
+        JSON of the :class:`TagResponse` (``{"id", "name"}``) with HTTP 201 when
+        the association is newly created, or 200 when it already existed.
+    """
+    recipe, error = _get_owned_recipe_or_error(recipe_id)
+    if error is not None:
+        return error
+
+    try:
+        payload = TagAddRequest.model_validate(request.get_json(silent=True) or {})
+    except ValidationError as validation_error:
+        return jsonify({"error": _validation_error_message(validation_error)}), 400
+
+    tag = _find_or_create_tag(payload.name)
+
+    # Is this tag already attached to the recipe? Treat a repeat add as an
+    # idempotent success rather than creating a duplicate join row.
+    already_present = (
+        RecipeTag.query.filter_by(recipe_id=recipe.id, tag_id=tag.id).first()
+        is not None
+    )
+
+    if already_present:
+        response = TagResponse.model_validate(tag)
+        return jsonify(response.model_dump(mode="json")), 200
+
+    db.session.add(RecipeTag(recipe_id=recipe.id, tag_id=tag.id))
+    db.session.commit()
+
+    response = TagResponse.model_validate(tag)
+    return jsonify(response.model_dump(mode="json")), 201
+
+
+@recipes_bp.delete("/<uuid:recipe_id>/tags/<uuid:tag_id>")
+@require_auth
+def remove_tag(recipe_id, tag_id):
+    """Remove a tag association from a recipe owned by the caller.
+
+    Implements ``DELETE /recipes/{id}/tags/{tag_id}`` from ``docs/api.md``.
+    Lookup and ownership reuse :func:`_get_owned_recipe_or_error` (404 for a
+    missing/soft-deleted recipe, 403 for one owned by another user), matching
+    the rest of the ``/{id}`` surface.
+
+    This deletes only the **association** (the ``recipe_tags`` row); the global
+    :class:`Tag` row is intentionally left intact because tags are a shared
+    pool — other users' recipes (or the caller's other recipes) may still use
+    it, and deleting the global row would strip the tag from them too.
+
+    If the recipe does not carry the given tag, the request returns **404**
+    (``"Tag not found on recipe"``) — there is nothing to remove. This covers
+    both an unknown ``tag_id`` and a real tag that is simply not attached here.
+
+    Returns:
+        An empty body with HTTP 204 when the association was removed.
+    """
+    recipe, error = _get_owned_recipe_or_error(recipe_id)
+    if error is not None:
+        return error
+
+    association = RecipeTag.query.filter_by(
+        recipe_id=recipe.id, tag_id=tag_id
+    ).first()
+    if association is None:
+        return jsonify({"error": "Tag not found on recipe"}), 404
+
+    db.session.delete(association)
     db.session.commit()
 
     return "", 204
