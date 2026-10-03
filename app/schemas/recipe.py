@@ -149,6 +149,70 @@ class RecipeListResponse(BaseModel):
     recipes: list[RecipeCard]
     total: int
 
+
+# ---------------------------------------------------------------------------
+# Image upload (presigned URL request/response)
+# ---------------------------------------------------------------------------
+
+#: The MIME types accepted for a direct-to-S3 image/document upload, mirroring
+#: the "Supported types" line in ``docs/api.md`` under ``POST /recipes/upload``.
+#: A ``content_type`` outside this set is rejected with a 400.
+ALLOWED_UPLOAD_CONTENT_TYPES = (
+    "image/jpeg",
+    "image/png",
+    "image/heic",
+    "application/pdf",
+)
+
+#: ``Literal`` form of :data:`ALLOWED_UPLOAD_CONTENT_TYPES` so pydantic rejects
+#: an unsupported ``content_type`` as a validation error (surfaced as a 400).
+UploadContentType = Literal[
+    "image/jpeg",
+    "image/png",
+    "image/heic",
+    "application/pdf",
+]
+
+
+class UploadRequest(BaseModel):
+    """Validated request body for ``POST /recipes/upload``.
+
+    Mirrors ``docs/api.md``: the client declares the ``filename`` it wants to
+    upload and the ``content_type`` of the bytes. ``filename`` must be a
+    non-empty string (after stripping); ``content_type`` is constrained to the
+    four supported MIME types, so an unsupported type is rejected with a 400
+    rather than producing an unusable presigned URL. Unknown fields are
+    rejected (``extra="forbid"``) so a typo surfaces as a 400 instead of being
+    silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    content_type: UploadContentType
+
+    @field_validator("filename")
+    @classmethod
+    def _filename_non_empty(cls, value: str) -> str:
+        """Require a filename that is non-empty after stripping whitespace."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("filename must not be empty")
+        return stripped
+
+
+class UploadResponse(BaseModel):
+    """Response body for ``POST /recipes/upload``.
+
+    Carries the presigned ``upload_url`` the client ``PUT``s the bytes to and
+    the ``s3_key`` the object will live at — the key the client later hands to
+    ``POST /recipes/extract``. The URL is time-limited (15 minutes); see
+    :func:`app.services.s3.generate_presigned_put`.
+    """
+
+    upload_url: str
+    s3_key: str
+
 # ---------------------------------------------------------------------------
 # Create request
 # ---------------------------------------------------------------------------
