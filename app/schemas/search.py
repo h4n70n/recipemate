@@ -1,12 +1,17 @@
-"""Pydantic v2 schema for the ``GET /search`` heuristic filter endpoint.
+"""Pydantic v2 schemas for the search endpoints.
 
-This module hosts :class:`SearchQuery`, the validated/normalised form of the
-query parameters documented for ``GET /search`` in ``docs/api.md``. The search
-*response* reuses the recipe-card shapes from :mod:`app.schemas.recipe`
-(``RecipeCard`` / ``RecipeListResponse``) because the card is identical to the
-one returned by ``GET /recipes`` — only the filtering differs.
+This module hosts the request/response shapes for both search endpoints:
 
-Validation choices (documented inline on the fields):
+* ``GET /search`` (TASK-3.1) — :class:`SearchQuery`, the validated/normalised
+  form of the heuristic filter query params. Its *response* reuses the
+  recipe-card shapes from :mod:`app.schemas.recipe` (``RecipeCard`` /
+  ``RecipeListResponse``) because the card is identical to ``GET /recipes`` —
+  only the filtering differs.
+* ``POST /search/llm`` (TASK-3.2) — :class:`LlmSearchRequest` for the
+  ``{"query": "..."}`` body, :class:`LlmRecipeCard` (a ``RecipeCard`` plus a
+  ``match_explanation``), and :class:`LlmSearchResponse` (``{"recipes": [...]}``).
+
+``SearchQuery`` validation choices (documented inline on the fields):
 
 * ``sort`` is a closed enum; an unrecognised value is a 400 (it is a typed
   control, not free text, so silently defaulting would hide a client bug).
@@ -26,7 +31,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Reuse the list endpoint's pagination defaults/bounds so the two endpoints
 # page identically.
-from app.schemas.recipe import DEFAULT_LIMIT, MAX_LIMIT
+from app.schemas.recipe import DEFAULT_LIMIT, MAX_LIMIT, RecipeCard
+
+
+# ---------------------------------------------------------------------------
+# Heuristic filter query (GET /search) — TASK-3.1
+# ---------------------------------------------------------------------------
 
 #: The four accepted ``sort`` values, in the order documented in
 #: ``docs/api.md``. ``newest`` is the default when the param is absent.
@@ -160,3 +170,83 @@ class SearchQuery(BaseModel):
     @classmethod
     def _clamp_offset(cls, value: int) -> int:
         return max(value, 0)
+
+
+# ---------------------------------------------------------------------------
+# LLM natural-language search (POST /search/llm) — TASK-3.2
+# ---------------------------------------------------------------------------
+
+#: Upper bound on a natural-language query's length (after stripping). A
+#: generous-but-finite cap keeps a stray paste from building an unbounded LLM
+#: prompt (and an unbounded cache key payload). Enforced as a 400.
+MAX_QUERY_LENGTH = 1000
+
+
+class LlmSearchRequest(BaseModel):
+    """Validated request body for ``POST /search/llm``.
+
+    The caller supplies a single natural-language ``query`` (e.g. "I have
+    chicken thighs, garlic, and a lemon"). It must be a non-empty string after
+    stripping surrounding whitespace and no longer than
+    :data:`MAX_QUERY_LENGTH` characters. Unknown fields are rejected
+    (``extra="forbid"``) so a typo surfaces as a 400 rather than being silently
+    dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+
+    @field_validator("query")
+    @classmethod
+    def _query_valid(cls, value: str) -> str:
+        """Strip the query and require it be non-empty and within the cap."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query must not be empty")
+        if len(stripped) > MAX_QUERY_LENGTH:
+            raise ValueError(
+                f"query must be at most {MAX_QUERY_LENGTH} characters"
+            )
+        return stripped
+
+
+class LlmRecipeCard(RecipeCard):
+    """A recipe card augmented with an LLM (or fallback) match explanation.
+
+    Extends :class:`~app.schemas.recipe.RecipeCard` with a single additional
+    field, ``match_explanation``: a short human-readable sentence describing
+    why this recipe matched the user's natural-language query. For LLM results
+    the explanation comes from the model; for the heuristic fallback it is a
+    generic "Matched on: <tokens>" string.
+    """
+
+    match_explanation: str
+
+    @classmethod
+    def from_card(
+        cls, card: RecipeCard, *, match_explanation: str
+    ) -> "LlmRecipeCard":
+        """Promote a plain :class:`RecipeCard` to an :class:`LlmRecipeCard`.
+
+        Copies the card's fields verbatim and attaches ``match_explanation``.
+
+        Args:
+            card: The already-built compact recipe card.
+            match_explanation: The reason this recipe matched the query.
+
+        Returns:
+            A populated :class:`LlmRecipeCard`.
+        """
+        return cls(**card.model_dump(), match_explanation=match_explanation)
+
+
+class LlmSearchResponse(BaseModel):
+    """Envelope for ``POST /search/llm``: the ranked list of matching cards.
+
+    Mirrors the ``{"recipes": [...]}`` shape used across the API. The order of
+    ``recipes`` is significant — it is the ranking (best match first) produced
+    by the LLM, or the heuristic ordering when the fallback path is taken.
+    """
+
+    recipes: list[LlmRecipeCard]
