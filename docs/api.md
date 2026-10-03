@@ -93,6 +93,53 @@ Auth required. Poll extraction progress.
 
 Response: `{"extraction_status": "pending|processing|complete|failed"}`
 
+## Tags
+
+Tags are a globally shared pool keyed by name: `tags.name` is unique, so a given
+label (e.g. `Italian`) is one row reused across every user and recipe that
+applies it. Tag names are stored with surrounding whitespace stripped and case
+preserved, so `Italian` and `italian` are distinct tags.
+
+Tags also appear embedded in recipe responses: `GET /recipes/{id}` returns a
+`tags` array of name strings, and each card in `GET /recipes` / `GET /search`
+carries the same `tags` field.
+
+### POST /recipes/{id}/tags
+
+Auth required. Add a tag to a recipe. Creates the global tag if it does not
+already exist; an existing tag (even one only used by another user) is reused.
+
+Request body: `{"name": "Italian"}` — `name` required, non-empty after
+stripping, max 100 characters.
+
+Response: tag object `{"id": "<uuid>", "name": "Italian"}`.
+
+- `201` when the association is newly created.
+- `200` when the recipe already carries the tag (idempotent — no duplicate
+  association is created).
+- `400` on a missing/empty/over-long `name` or an unknown field.
+- `403` if the recipe is owned by another user; `404` if it is missing or
+  soft-deleted.
+
+### DELETE /recipes/{id}/tags/{tag_id}
+
+Auth required. Remove a tag from a recipe. This deletes only the association
+between the recipe and the tag — the global tag row is left intact because
+other recipes may still use it.
+
+- `204` when the association is removed.
+- `404` if the recipe does not carry that tag.
+- `403` if the recipe is owned by another user; `404` if it is missing or
+  soft-deleted.
+
+### GET /tags
+
+Auth required. List the distinct tags used by the current user, for
+autocomplete. Returns only the tags attached to the caller's own,
+non-soft-deleted recipes (not every tag globally), ordered by name.
+
+Response: `{"tags": [{"id": "<uuid>", "name": "Italian"}, ...]}`.
+
 ## Cook Logs
 
 ### GET /recipes/{id}/cooks

@@ -56,10 +56,12 @@ def create_app(config_name: str | None = None) -> Flask:
     from app.routes.recipes import recipes_bp  # noqa: PLC0415
     from app.routes.search import search_bp  # noqa: PLC0415
     from app.routes.cooks import cooks_bp  # noqa: PLC0415
+    from app.routes.tags import tags_bp  # noqa: PLC0415
 
     app.register_blueprint(recipes_bp)
     app.register_blueprint(search_bp)
     app.register_blueprint(cooks_bp)
+    app.register_blueprint(tags_bp)
 
     # ------------------------------------------------------------------
     # Built-in endpoints

@@ -151,6 +151,78 @@ class RecipeListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+#: Upper bound on a tag name's length (after stripping). Tags are short labels
+#: used for filtering/autocomplete, so a generous-but-finite cap keeps a stray
+#: paste from writing an unbounded ``TEXT`` value. Enforced as a 400.
+MAX_TAG_NAME_LENGTH = 100
+
+
+class TagAddRequest(BaseModel):
+    """Validated request body for ``POST /recipes/{id}/tags``.
+
+    The caller supplies a single ``name``. It must be a non-empty string after
+    stripping surrounding whitespace, and no longer than
+    :data:`MAX_TAG_NAME_LENGTH` characters. Unknown fields are rejected
+    (``extra="forbid"``) so a typo surfaces as a 400 rather than being silently
+    dropped.
+
+    Normalisation: the name is **stripped** of surrounding whitespace but its
+    **case is preserved**. Because ``tags.name`` is globally unique, this means
+    ``"Italian"`` and ``"italian"`` are distinct tags — case is significant.
+    Case preservation is intentional so the label displays exactly as the user
+    typed it; collapsing case would force an arbitrary canonical casing on a
+    shared pool of tags.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _name_valid(cls, value: str) -> str:
+        """Strip the name and require it be non-empty and within the length cap."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name must not be empty")
+        if len(stripped) > MAX_TAG_NAME_LENGTH:
+            raise ValueError(
+                f"name must be at most {MAX_TAG_NAME_LENGTH} characters"
+            )
+        return stripped
+
+
+class TagResponse(BaseModel):
+    """A single tag, used both in the add response and the ``GET /tags`` list.
+
+    Carries the tag's stable ``id`` (so clients can later ``DELETE`` the
+    association by id) and its display ``name``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+
+
+class TagListResponse(BaseModel):
+    """Envelope for ``GET /tags``: the caller's distinct used tags.
+
+    ``tags`` holds the :class:`TagResponse` objects for the tags attached to
+    the caller's own, non-soft-deleted recipes, ordered by name. The envelope
+    shape (``{"tags": [...]}``) mirrors the ``{"recipes": [...]}`` /
+    ``{"cooks": [...]}`` envelopes used by the rest of the API rather than a
+    bare top-level list, so the response has room to grow (e.g. a count) and is
+    consistent with its siblings.
+    """
+
+    tags: list[TagResponse]
+
+
+# ---------------------------------------------------------------------------
 # Image upload (presigned URL request/response)
 # ---------------------------------------------------------------------------
 
