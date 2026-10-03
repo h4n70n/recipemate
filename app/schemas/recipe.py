@@ -213,13 +213,74 @@ class UploadResponse(BaseModel):
     upload_url: str
     s3_key: str
 
+
 # ---------------------------------------------------------------------------
-# Create request
+# Recipe origin (shared literal)
 # ---------------------------------------------------------------------------
 
 #: The five recipe origins accepted by the API (mirrors the ``ck_recipes_origin``
 #: CHECK constraint on the model).
 RecipeOrigin = Literal["instagram", "web", "cookbook", "manual", "ios_share"]
+
+
+# ---------------------------------------------------------------------------
+# Async extraction (POST /recipes/extract + poll)
+# ---------------------------------------------------------------------------
+
+
+class ExtractRequest(BaseModel):
+    """Validated request body for ``POST /recipes/extract``.
+
+    Mirrors ``docs/api.md``: the client hands back the ``s3_key`` of an object
+    it already uploaded (via ``POST /recipes/upload``) and asks the API to run
+    async extraction against it. ``s3_key`` is required and must be non-empty
+    after stripping; ``origin`` is optional and constrained to the five allowed
+    values (reusing :data:`RecipeOrigin`) so a bad value is a 400; ``source_url``
+    is optional. Unknown fields are rejected (``extra="forbid"``) so a typo
+    surfaces as a 400 instead of being silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    s3_key: str
+    origin: RecipeOrigin | None = None
+    source_url: str | None = None
+
+    @field_validator("s3_key")
+    @classmethod
+    def _s3_key_non_empty(cls, value: str) -> str:
+        """Require an ``s3_key`` that is non-empty after stripping whitespace."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("s3_key must not be empty")
+        return stripped
+
+
+class ExtractResponse(BaseModel):
+    """Response body for ``POST /recipes/extract``.
+
+    Returns the id of the newly created ``pending`` recipe and its
+    ``extraction_status`` so the client can begin polling
+    ``GET /recipes/{id}/extraction-status``.
+    """
+
+    recipe_id: uuid.UUID
+    extraction_status: str
+
+
+class ExtractionStatusResponse(BaseModel):
+    """Response body for ``GET /recipes/{id}/extraction-status``.
+
+    Carries the recipe's current ``extraction_status`` — one of ``pending``,
+    ``processing``, ``complete``, or ``failed``.
+    """
+
+    extraction_status: str
+
+
+# ---------------------------------------------------------------------------
+# Create request
+# ---------------------------------------------------------------------------
 
 
 class RecipeCreate(BaseModel):

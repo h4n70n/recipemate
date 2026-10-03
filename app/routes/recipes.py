@@ -9,6 +9,7 @@ respective tasks.
 from __future__ import annotations
 
 import datetime
+import logging
 
 from flask import Blueprint, jsonify, request
 from pydantic import ValidationError
@@ -17,6 +18,9 @@ from app import db
 from app.auth import AuthError, current_user, require_auth
 from app.models.recipe import Recipe
 from app.schemas.recipe import (
+    ExtractionStatusResponse,
+    ExtractRequest,
+    ExtractResponse,
     RecipeCard,
     RecipeCreate,
     RecipeDetail,
@@ -26,10 +30,18 @@ from app.schemas.recipe import (
     UploadRequest,
     UploadResponse,
 )
-from app.services import redis_client, s3
+from app.services import redis_client, s3, sqs
 from app.services.urls import s3_key_to_url
 
 recipes_bp = Blueprint("recipes", __name__, url_prefix="/v1/recipes")
+
+logger = logging.getLogger(__name__)
+
+#: Placeholder title for a recipe created by ``POST /recipes/extract`` before
+#: the async consumer knows the real title. ``recipes.title`` is NOT NULL, but
+#: the recipe is created *before* extraction runs, so we seed a human-readable
+#: placeholder; the extraction Lambda overwrites it when it completes.
+_EXTRACTION_PLACEHOLDER_TITLE = "Untitled recipe"
 
 
 def _validation_error_message(error: ValidationError) -> str:
@@ -240,6 +252,122 @@ def upload():
     )
 
     response = UploadResponse(upload_url=upload_url, s3_key=s3_key)
+    return jsonify(response.model_dump(mode="json")), 200
+
+
+@recipes_bp.post("/extract")
+@require_auth
+def extract_recipe():
+    """Create a pending recipe and enqueue async extraction from an upload.
+
+    Implements ``POST /recipes/extract`` from ``docs/api.md``. The caller hands
+    back the ``s3_key`` of an object it already uploaded (via
+    ``POST /recipes/upload``) together with an optional ``origin`` and
+    ``source_url``. The view:
+
+    1. validates the body (400 on a missing/empty ``s3_key``, bad ``origin``,
+       or unknown field),
+    2. creates a recipe owned by the caller with ``extraction_status="pending"``
+       and a placeholder ``title`` (``recipes.title`` is NOT NULL but the real
+       title is not known until extraction finishes; the Lambda overwrites it),
+    3. commits, then enqueues an SQS message carrying the new recipe id, the
+       ``s3_key``, and the owner id for the extraction consumer,
+    4. returns ``{"recipe_id", "extraction_status": "pending"}`` with 201.
+
+    Enqueue-failure contract
+    ------------------------
+    If the SQS send fails, the recipe is **rolled back** (deleted) and the
+    request returns 503. This is the cleaner contract: a ``pending`` recipe
+    whose job never reached the queue would be a permanent orphan the consumer
+    never processes, so we would rather fail the call atomically and let the
+    client retry than leave a stuck row behind. (The alternative — persist the
+    recipe as ``failed`` and still return 201 — was rejected because it leaves
+    a dead recipe in the user's list for an outage that is almost always
+    transient and retryable.)
+
+    Upload-attribution note
+    -----------------------
+    We do **not** cross-check the Redis ``upload:<s3_key>`` metadata against the
+    caller: that record is best-effort and expires with the presigned URL (15
+    min), so a legitimate extract shortly after the window closes would fail
+    spuriously. Ownership is instead established by making the authenticated
+    caller the recipe owner. The uploaded key is opaque/unguessable (a uuid
+    segment), so this is an acceptable trade-off.
+
+    Returns:
+        JSON ``{"recipe_id": "<uuid>", "extraction_status": "pending"}`` with
+        HTTP 201, or ``{"error": ...}`` with 400 (validation) / 503 (enqueue
+        failure).
+    """
+    try:
+        payload = ExtractRequest.model_validate(request.get_json(silent=True) or {})
+    except ValidationError as error:
+        return jsonify({"error": _validation_error_message(error)}), 400
+
+    recipe = Recipe(
+        user_id=current_user.id,
+        title=_EXTRACTION_PLACEHOLDER_TITLE,
+        image_s3_key=payload.s3_key,
+        origin=payload.origin,
+        source_url=payload.source_url,
+        extraction_status="pending",
+        cook_count=0,
+    )
+    db.session.add(recipe)
+    db.session.commit()
+
+    try:
+        sqs.enqueue_extraction(recipe.id, payload.s3_key, current_user.id)
+    except Exception as error:  # noqa: BLE001 - any enqueue failure is handled the same
+        # Roll back the recipe so we never leave an orphaned ``pending`` row
+        # whose extraction job never reached the queue.
+        logger.warning(
+            "Failed to enqueue extraction for recipe %s (rolling back): %s",
+            recipe.id,
+            error,
+        )
+        db.session.delete(recipe)
+        db.session.commit()
+        return (
+            jsonify({"error": "Failed to enqueue extraction; please retry"}),
+            503,
+        )
+
+    response = ExtractResponse(
+        recipe_id=recipe.id,
+        extraction_status=recipe.extraction_status,
+    )
+    return jsonify(response.model_dump(mode="json")), 201
+
+
+@recipes_bp.get("/<uuid:recipe_id>/extraction-status")
+@require_auth
+def get_extraction_status(recipe_id):
+    """Report the current extraction status of a recipe owned by the caller.
+
+    Implements ``GET /recipes/{id}/extraction-status`` from ``docs/api.md``:
+    the poll endpoint a client hits after ``POST /recipes/extract`` to watch
+    the job progress through ``pending`` → ``processing`` → ``complete`` /
+    ``failed``.
+
+    Lookup and ownership reuse :func:`_get_owned_recipe_or_error`, matching the
+    other ``/{id}`` endpoints exactly: a missing or soft-deleted recipe returns
+    404, a recipe owned by another user returns 403.
+
+    Args:
+        recipe_id: The recipe UUID parsed from the path by Flask's ``uuid``
+            converter. The typed converter and the distinct ``/extraction-status``
+            suffix keep this route from colliding with ``GET /recipes/{id}``.
+
+    Returns:
+        JSON ``{"extraction_status": "pending|processing|complete|failed"}``
+        with HTTP 200.
+    """
+    recipe, error = _get_owned_recipe_or_error(recipe_id)
+    if error is not None:
+        return error
+
+    response = ExtractionStatusResponse(extraction_status=recipe.extraction_status)
     return jsonify(response.model_dump(mode="json")), 200
 
 

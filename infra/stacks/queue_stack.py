@@ -29,6 +29,12 @@ from constructs import Construct
 LAMBDA_TIMEOUT = Duration.seconds(120)
 QUEUE_VISIBILITY_TIMEOUT = Duration.seconds(300)
 
+# DLQ-consumer Lambda — it only touches the DB and (optionally) SNS, so it is
+# far lighter than the extraction function. A short timeout and modest memory
+# are plenty for a status UPDATE plus a best-effort publish.
+DLQ_LAMBDA_TIMEOUT = Duration.seconds(60)
+DLQ_LAMBDA_MEMORY = 512
+
 
 class QueueStack(Stack):
     """
@@ -41,11 +47,16 @@ class QueueStack(Stack):
         memory, wired to the queue via an SQS event source (batch size 1).
       - IAM grants allowing the Lambda to consume the queue, read from the
         recipe-images S3 bucket, and fetch the OpenAI API key secret.
+      - A Python 3.11 Lambda function (``dlq_handler.handler``) consuming the
+        DLQ (batch size 10): it records the permanent failure, defensively
+        marks the recipe ``failed`` in the DB, and best-effort notifies the
+        user via SNS. Granted consume permission on the DLQ.
 
     Properties exposed for other stacks:
       - ``queue``             – the main extraction SQS Queue.
       - ``dlq``               – the dead-letter SQS Queue.
       - ``extraction_lambda`` – the extraction Lambda Function.
+      - ``dlq_lambda``        – the DLQ-consumer Lambda Function.
     """
 
     def __init__(
@@ -123,6 +134,16 @@ class QueueStack(Stack):
             ),
         )
 
+        # The ``lambda/`` directory lives at the repository root. Resolve it to
+        # an absolute path relative to this file (infra/stacks/ -> repo root) so
+        # the asset is found regardless of the directory cdk is invoked from.
+        # Both the extraction function and the DLQ consumer ship from this one
+        # asset (``dlq_handler`` imports helpers from ``extract_handler``).
+        lambda_asset_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "lambda",
+        )
+
         # ------------------------------------------------------------------ #
         # Extraction Lambda function.                                        #
         # ------------------------------------------------------------------ #
@@ -132,16 +153,7 @@ class QueueStack(Stack):
             function_name=f"{self.stack_name}-extraction",
             runtime=aws_lambda.Runtime.PYTHON_3_11,
             handler="extract_handler.handler",
-            # The ``lambda/`` directory lives at the repository root. Resolve it
-            # to an absolute path relative to this file (infra/stacks/ -> repo
-            # root) so the asset is found regardless of the directory cdk is
-            # invoked from.
-            code=aws_lambda.Code.from_asset(
-                os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                    "lambda",
-                )
-            ),
+            code=aws_lambda.Code.from_asset(lambda_asset_dir),
             timeout=LAMBDA_TIMEOUT,
             memory_size=1024,
             environment={
@@ -190,6 +202,55 @@ class QueueStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # DLQ-consumer Lambda function.                                       #
+        #                                                                     #
+        # A message that exhausts the main queue's retries lands in the DLQ.  #
+        # This function consumes the DLQ, defensively marks the recipe        #
+        # ``failed`` in the DB, logs the dead-letter prominently (so an alarm #
+        # can fire on it), and best-effort notifies the user via SNS. It is   #
+        # deliberately light — no S3, no OpenAI — so it only receives         #
+        # DATABASE_URL and the optional SNS topic ARN.                        #
+        # ------------------------------------------------------------------ #
+        dlq_environment: dict[str, str] = {"DATABASE_URL": database_url}
+        sns_topic_arn: str | None = self.node.try_get_context(
+            "snsNotificationsTopicArn"
+        )
+        if sns_topic_arn:
+            dlq_environment["SNS_NOTIFICATIONS_TOPIC_ARN"] = sns_topic_arn
+
+        self._dlq_lambda = aws_lambda.Function(
+            self,
+            "DLQConsumerFunction",
+            function_name=f"{self.stack_name}-extraction-dlq-consumer",
+            runtime=aws_lambda.Runtime.PYTHON_3_11,
+            handler="dlq_handler.handler",
+            # Same asset as the extraction function — dlq_handler reuses
+            # extract_handler's engine / notification helpers.
+            code=aws_lambda.Code.from_asset(lambda_asset_dir),
+            timeout=DLQ_LAMBDA_TIMEOUT,
+            memory_size=DLQ_LAMBDA_MEMORY,
+            environment=dlq_environment,
+            description=(
+                "Consumes dead-lettered extraction jobs: records the "
+                "permanent failure and marks the recipe failed"
+            ),
+        )
+
+        # Consume messages from the dead-letter queue.
+        self._dlq.grant_consume_messages(self._dlq_lambda)
+
+        # Deliver dead-lettered messages to the consumer. A small batch keeps
+        # one slow DB write from stalling the rest; failures are handled per
+        # record inside the handler (it never raises) so partial-batch
+        # reporting is unnecessary.
+        self._dlq_lambda.add_event_source(
+            lambda_event_sources.SqsEventSource(
+                self._dlq,
+                batch_size=10,
+            )
+        )
+
+        # ------------------------------------------------------------------ #
         # CloudFormation Outputs                                             #
         # ------------------------------------------------------------------ #
         cdk.CfnOutput(
@@ -216,6 +277,12 @@ class QueueStack(Stack):
             value=self._extraction_lambda.function_arn,
             description="ARN of the recipe-extraction Lambda function",
         )
+        cdk.CfnOutput(
+            self,
+            "ExtractionDLQConsumerLambdaArn",
+            value=self._dlq_lambda.function_arn,
+            description="ARN of the extraction DLQ-consumer Lambda function",
+        )
 
     # ---------------------------------------------------------------------- #
     # Public properties                                                       #
@@ -235,6 +302,11 @@ class QueueStack(Stack):
     def extraction_lambda(self) -> aws_lambda.Function:
         """The Lambda function that consumes the queue and runs extraction."""
         return self._extraction_lambda
+
+    @property
+    def dlq_lambda(self) -> aws_lambda.Function:
+        """The Lambda function that consumes the dead-letter queue."""
+        return self._dlq_lambda
 
     @property
     def openai_secret(self):
