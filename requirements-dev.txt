@@ -1,0 +1,12 @@
+# Development / test-only dependencies.
+#
+# Runtime deps live in requirements.txt; install both to run the suite:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# pytest and pytest-flask are already pinned in requirements.txt. The test
+# tokens are minted with python-jose[cryptography] (also in requirements.txt),
+# whose `cryptography` extra provides the RSA keypair + JWK construction the
+# validate_token tests rely on. No additional test-only packages are required
+# today; pins are restated here so the dev surface is explicit and reproducible.
+pytest==8.2.0
+pytest-flask==1.3.0
