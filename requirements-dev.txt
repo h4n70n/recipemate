@@ -6,7 +6,12 @@
 # pytest and pytest-flask are already pinned in requirements.txt. The test
 # tokens are minted with python-jose[cryptography] (also in requirements.txt),
 # whose `cryptography` extra provides the RSA keypair + JWK construction the
-# validate_token tests rely on. No additional test-only packages are required
-# today; pins are restated here so the dev surface is explicit and reproducible.
+# validate_token tests rely on.
+#
+# moto[s3] fakes S3 in-process for the presigned-URL upload tests
+# (tests/recipes/test_upload.py), so those tests need no running LocalStack and
+# never contact real AWS. boto3 is pinned in requirements.txt (used by
+# app.services.s3); it is restated as a comment there, not duplicated here.
 pytest==8.2.0
 pytest-flask==1.3.0
+moto[s3]==5.2.3

@@ -23,7 +23,10 @@ from app.schemas.recipe import (
     RecipeListQuery,
     RecipeListResponse,
     RecipeUpdate,
+    UploadRequest,
+    UploadResponse,
 )
+from app.services import redis_client, s3
 from app.services.urls import s3_key_to_url
 
 recipes_bp = Blueprint("recipes", __name__, url_prefix="/v1/recipes")
@@ -178,6 +181,66 @@ def create_recipe():
 
     detail = RecipeDetail.from_model(recipe)
     return jsonify(detail.model_dump(mode="json")), 201
+
+
+#: Presigned upload URL (and the matching metadata record) live for 15 minutes,
+#: as documented in ``docs/api.md`` under ``POST /recipes/upload``.
+_UPLOAD_URL_TTL_SECONDS = 900
+
+
+@recipes_bp.post("/upload")
+@require_auth
+def upload():
+    """Mint a presigned S3 ``PUT`` URL for a direct-to-S3 image/document upload.
+
+    Implements ``POST /recipes/upload`` from ``docs/api.md``. The caller
+    declares the ``filename`` and ``content_type`` it wants to upload; the view
+    validates them, allocates an opaque, collision-free object key
+    (``uploads/<uuid>/<basename>`` via
+    :func:`~app.services.s3.build_upload_key`, which also sanitises the
+    filename to its basename), and returns a presigned ``PUT`` URL valid for 15
+    minutes together with that key. The client then ``PUT``s the bytes straight
+    to S3 and later hands the ``s3_key`` to ``POST /recipes/extract``.
+
+    Validation failures — an unsupported ``content_type`` (only
+    ``image/jpeg``, ``image/png``, ``image/heic``, ``application/pdf`` are
+    accepted), a missing/empty ``filename``, or any unknown field — return 400
+    with the shared concise ``{"error": ...}`` body.
+
+    Upload metadata (requesting user, filename, content type) is recorded in
+    Redis keyed by the S3 key on a **best-effort** basis: if Redis is
+    unavailable the write is skipped (logged as a warning) and the presigned
+    URL is still returned, since the URL — not the cache record — is the
+    product of this endpoint. See
+    :func:`~app.services.redis_client.store_upload_metadata`.
+
+    Returns:
+        JSON ``{"upload_url": "https://...", "s3_key": "uploads/<uuid>/..."}``
+        with HTTP 200.
+    """
+    try:
+        payload = UploadRequest.model_validate(request.get_json(silent=True) or {})
+    except ValidationError as error:
+        return jsonify({"error": _validation_error_message(error)}), 400
+
+    s3_key = s3.build_upload_key(current_user.id, payload.filename)
+    upload_url = s3.generate_presigned_put(
+        s3_key,
+        payload.content_type,
+        expires_in=_UPLOAD_URL_TTL_SECONDS,
+    )
+
+    # Best-effort: a Redis outage here must not fail the request.
+    redis_client.store_upload_metadata(
+        s3_key,
+        current_user.id,
+        payload.filename,
+        payload.content_type,
+        ttl=_UPLOAD_URL_TTL_SECONDS,
+    )
+
+    response = UploadResponse(upload_url=upload_url, s3_key=s3_key)
+    return jsonify(response.model_dump(mode="json")), 200
 
 
 @recipes_bp.get("/<uuid:recipe_id>")
