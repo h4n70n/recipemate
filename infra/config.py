@@ -35,7 +35,7 @@ class EnvConfig:
 # Account resolves from the CDK CLI environment when available; otherwise a
 # per-env placeholder keeps `cdk synth` working without AWS credentials.
 _DEFAULT_ACCOUNT = os.environ.get("CDK_DEFAULT_ACCOUNT")
-_DEFAULT_REGION = os.environ.get("CDK_DEFAULT_REGION", "us-east-1")
+_DEFAULT_REGION = os.environ.get("CDK_DEFAULT_REGION", "us-east-2")
 
 
 ENV_CONFIG: dict[str, EnvConfig] = {

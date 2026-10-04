@@ -28,7 +28,7 @@ class Config:
     REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
     # AWS
-    AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-1")
+    AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-2")
     S3_BUCKET: str = os.environ.get("S3_BUCKET", "recipemate-images")
     # Optional custom endpoint for the AWS SDK (boto3). Left empty in deployed
     # environments so boto3 targets real AWS; set to e.g.
@@ -48,7 +48,7 @@ class Config:
     # Cognito
     COGNITO_USER_POOL_ID: str = os.environ.get("COGNITO_USER_POOL_ID", "")
     COGNITO_CLIENT_ID: str = os.environ.get("COGNITO_CLIENT_ID", "")
-    COGNITO_REGION: str = os.environ.get("COGNITO_REGION", "us-east-1")
+    COGNITO_REGION: str = os.environ.get("COGNITO_REGION", "us-east-2")
 
 
 class LocalConfig(Config):

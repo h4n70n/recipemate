@@ -22,6 +22,7 @@ from stacks.api_stack import ApiStack
 from stacks.auth_stack import AuthStack
 from stacks.cache_stack import CacheStack
 from stacks.database_stack import DatabaseStack
+from stacks.pipeline_oidc_stack import PipelineOidcStack
 from stacks.queue_stack import QueueStack
 from stacks.secrets_stack import SecretsStack
 from stacks.storage_stack import StorageStack
@@ -76,5 +77,12 @@ api_stack = ApiStack(app, f"{prefix}-Api", env=cdk_env)
 # pipeline syncs frontend/dist into this bucket and invalidates the
 # distribution; its outputs (bucket name, distribution id) feed the deploy vars.
 web_stack = WebStack(app, f"{prefix}-Web", env=cdk_env)
+# GitHub OIDC trust + least-privilege backend deploy role so CI can run CDK,
+# push to ECR, and roll the ECS service without static AWS keys. Repo and
+# provider-creation behaviour are set via CDK context (githubRepo,
+# createOidcProvider); the role ARN is emitted for the GitHub secret.
+pipeline_oidc_stack = PipelineOidcStack(
+    app, f"{prefix}-PipelineOidc", env=cdk_env
+)
 
 app.synth()

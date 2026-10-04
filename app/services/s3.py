@@ -58,7 +58,7 @@ def get_s3_client():
     Returns:
         A configured boto3 S3 client.
     """
-    region = current_app.config.get("AWS_REGION") or "us-east-1"
+    region = current_app.config.get("AWS_REGION") or "us-east-2"
     endpoint_url = current_app.config.get("AWS_ENDPOINT_URL") or None
 
     return boto3.client(
