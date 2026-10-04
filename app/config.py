@@ -1,21 +1,62 @@
 """Environment-based configuration for RecipeMate."""
 
 import os
+from urllib.parse import quote_plus
+
+#: The permissive placeholder SECRET_KEY the base config falls back to. Allowed
+#: for local/testing; staging and prod refuse to start while it is in effect
+#: (see ``_require_real_secret_key``).
+_INSECURE_SECRET_KEY_DEFAULT = "change-me-in-production"
+
+
+def _compose_database_uri() -> str:
+    """Resolve the SQLAlchemy database URI from the environment.
+
+    Two paths, in priority order:
+
+    1. **ECS/Secrets Manager path** — when the individual RDS fields
+       (``DB_USER``/``DB_PASSWORD``/``DB_HOST``/``DB_PORT``/``DB_NAME``) are
+       injected as container secrets (see ``infra/stacks/api_stack.py``),
+       compose ``postgresql+psycopg2://user:pass@host:port/dbname`` from them.
+       The RDS secret has no ready-made URL, which is why the API stack injects
+       the parts and we assemble them here. The password is URL-encoded so a
+       generated password containing reserved characters cannot corrupt the
+       URL.
+    2. **Local/dev path** — fall back to a directly supplied ``DATABASE_URL``
+       (Docker Compose sets this), then to the local default. This keeps local
+       development and the test suite working unchanged.
+
+    The field names consumed here MUST match the keys ``ApiStack`` injects.
+    """
+    user = os.environ.get("DB_USER")
+    password = os.environ.get("DB_PASSWORD")
+    host = os.environ.get("DB_HOST")
+    name = os.environ.get("DB_NAME")
+    port = os.environ.get("DB_PORT", "5432")
+
+    if user and password and host and name:
+        return (
+            f"postgresql+psycopg2://{quote_plus(user)}:{quote_plus(password)}"
+            f"@{host}:{port}/{name}"
+        )
+
+    return os.environ.get(
+        "DATABASE_URL",
+        "postgresql+psycopg2://recipemate:recipemate@localhost:5432/recipemate",
+    )
 
 
 class Config:
     """Base configuration shared across all environments."""
 
     # Flask
-    SECRET_KEY: str = os.environ.get("SECRET_KEY", "change-me-in-production")
+    SECRET_KEY: str = os.environ.get("SECRET_KEY", _INSECURE_SECRET_KEY_DEFAULT)
     DEBUG: bool = False
     TESTING: bool = False
 
-    # SQLAlchemy
-    SQLALCHEMY_DATABASE_URI: str = os.environ.get(
-        "DATABASE_URL",
-        "postgresql+psycopg2://recipemate:recipemate@localhost:5432/recipemate",
-    )
+    # SQLAlchemy — composed from injected RDS secret parts in staging/prod, or
+    # a direct DATABASE_URL locally. See ``_compose_database_uri``.
+    SQLALCHEMY_DATABASE_URI: str = _compose_database_uri()
     SQLALCHEMY_TRACK_MODIFICATIONS: bool = False
     # Defer actual connection until first query; avoids driver import errors at
     # startup when the database is not yet reachable (e.g. during testing or cold start).
@@ -57,13 +98,34 @@ class LocalConfig(Config):
     DEBUG = True
 
 
-class StagingConfig(Config):
+class _SecretKeyEnforcedConfig(Config):
+    """Base for deployed configs that refuse to start without a real key.
+
+    Staging and prod load ``SECRET_KEY`` from Secrets Manager at runtime (via
+    the ECS container secret). If it is unset or still the insecure
+    ``change-me-in-production`` placeholder, the app must fail closed rather
+    than sign sessions/CSRF tokens with a known key. Local keeps the permissive
+    default, so this check lives only on the deployed configs.
+    """
+
+    @classmethod
+    def _require_real_secret_key(cls) -> None:
+        if not cls.SECRET_KEY or cls.SECRET_KEY == _INSECURE_SECRET_KEY_DEFAULT:
+            raise RuntimeError(
+                "SECRET_KEY must be set to a real value in staging/prod "
+                "(loaded from Secrets Manager at runtime). It is unset or still "
+                f"the insecure '{_INSECURE_SECRET_KEY_DEFAULT}' default; refusing "
+                "to start."
+            )
+
+
+class StagingConfig(_SecretKeyEnforcedConfig):
     """Staging environment configuration."""
 
     pass
 
 
-class ProdConfig(Config):
+class ProdConfig(_SecretKeyEnforcedConfig):
     """Production environment configuration."""
 
     pass
@@ -88,4 +150,8 @@ def get_config(config_name: str | None = None) -> Config:
     """
     env = config_name or os.environ.get("FLASK_ENV", _DEFAULT_ENV)
     cls = _CONFIG_MAP.get(env, LocalConfig)
+    # Staging/prod fail closed on a missing or placeholder SECRET_KEY; local
+    # keeps the permissive default so dev and the test suite are unaffected.
+    if issubclass(cls, _SecretKeyEnforcedConfig):
+        cls._require_real_secret_key()
     return cls()

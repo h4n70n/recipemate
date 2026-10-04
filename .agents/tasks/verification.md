@@ -1,120 +1,109 @@
-# Verification — TASK-8.1 & TASK-8.2 (feat/deploy-foundation)
+# Verification — TASK-8.3 (feat/secrets-manager)
 
-This note records exactly what was run and the results, so the review does not
-need to re-run anything.
+Secrets Manager configuration and runtime key loading. This note records the
+exact commands run and their outcomes so the reviewer does not need to re-run
+the suites.
 
 ## Environment
 
-- `aws-cdk-lib` pinned version: **2.144.0** (`pip show aws-cdk-lib`).
-- CDK CLI + Node resolved from `/home/dr1ftp1n/.local/node/bin` (added to PATH
-  for the synth runs; `node` is not on the default PATH in this sandbox).
-- The worktree has no `infra/.venv`; the main repo's `/home/dr1ftp1n/recipemate/infra/.venv`
-  Python (identical pinned deps) was used as the CDK app interpreter via
-  `cdk synth --app "<venv>/bin/python app.py"`. The app code under test is the
-  worktree copy at `.worktrees/deploy-foundation/infra`.
+- `aws-cdk-lib` pinned version: **2.144.0**
+  (`/home/dr1ftp1n/recipemate/infra/.venv/bin/python -m pip show aws-cdk-lib`).
+- CDK CLI **2.1016.1**; Node v20.17.0 resolved from
+  `/home/dr1ftp1n/.local/node/bin` (added to PATH for synth; `node`/`cdk` are
+  not on the default sandbox PATH).
+- The worktree has no `infra/.venv`; the main repo's
+  `/home/dr1ftp1n/recipemate/infra/.venv` Python (same pinned deps, has pytest
+  9.1.1 + Flask/SQLAlchemy/jose/cryptography/moto) was used as the CDK app
+  interpreter and the pytest runner. The code under test is the worktree copy.
 
-## TASK-8.1 — region grep
+## (a) CDK synth
 
-Command:
-
-```
-grep -rn "us-east-1" \
-  .worktrees/deploy-foundation/app/ \
-  .worktrees/deploy-foundation/infra/ \
-  .worktrees/deploy-foundation/docs/ \
-  .worktrees/deploy-foundation/.env.example
-```
-
-Remaining matches after the change (all intentional):
-
-- `.env.example:78` and `.env.example:80` — SNS **LocalStack** example/default
-  ARN (`arn:aws:sns:us-east-1:000000000000:...`). LocalStack `000000000000`
-  lines are left as-is per the task.
-- `infra/__pycache__/config.cpython-312.pyc` — stale compiled bytecode cache
-  (regenerates; not source).
-
-No `us-east-1` **default** remains in authored source outside the LocalStack
-local-only lines. In addition to the config files named in the task, two
-runtime region fallbacks that defaulted to `us-east-1` were aligned to
-`us-east-2` to satisfy the "no us-east-1 default remains" criterion:
-`app/services/s3.py` and `app/services/sqs.py` (both only used when
-`AWS_REGION` is unset, which now defaults to `us-east-2`).
-
-Stale CDK context cache for the no-longer-targeted region was removed from
-`infra/cdk.json` (the two `availability-zones:...:region=us-east-1` entries);
-they were keyed to us-east-1 and would never be consulted now that synth
-targets us-east-2.
-
-Out of scope / noted, not changed: `frontend/.env.example`
-(`VITE_COGNITO_REGION=us-east-1`) — frontend build-time Vite vars are sourced
-from CI (GitHub vars today, CodeBuild/SSM per TASK-8.4); not in the TASK-8.1
-file list or the verification grep scope.
-
-## TASK-8.2 — static-keys grep
-
-Command:
+Primary — the Secrets stack (no VPC/AZ lookup):
 
 ```
-grep -rn "AWS_SECRET_ACCESS_KEY\|AWS_ACCESS_KEY_ID" \
-  .worktrees/deploy-foundation/.env.example
+cdk synth --app "<venv>/bin/python app.py" RecipeMate-Staging-Secrets
 ```
 
-Result (only the LocalStack `test` values, which are fine):
+Result: **exit 0**. Template renders the new `FlaskSecretKey`
+`AWS::SecretsManager::Secret` (generated 64-char value under the `SECRET_KEY`
+JSON key, `RETAIN`), the existing `OpenAiApiKeySecret`, the
+`FlaskSecretKeyName`/`FlaskSecretKeyArn` outputs, and cross-stack `Export`s for
+both secrets.
+
+The Api stack trips the documented pre-existing AZ/VPC context lookup:
 
 ```
-50:AWS_ACCESS_KEY_ID=test
-51:AWS_SECRET_ACCESS_KEY=test
+cdk synth --app "<venv>/bin/python app.py" RecipeMate-Staging-Api
+# [Error at /RecipeMate-Staging-Api] Need to perform AWS calls for account
+# 111111111111, but no credentials have been configured
 ```
 
-## CDK synth
-
-Primary verification — synth the new stack (OIDC provider created path):
-
-```
-cdk synth --app "<venv>/bin/python app.py" RecipeMate-Staging-PipelineOidc
-```
-
-Result: **exit 0**. Template renders the GitHub OIDC provider, the
-`BackendDeployRole`, and the `BackendDeployRoleArn` output.
-
-Import path (existing provider), with repo context:
+This is the KNOWN PRE-EXISTING ISSUE (us-east-2 move needs real-credential AZ
+context); it is unrelated to the TASK-8.3 wiring. Per the task, I used the
+`python app.py` fallback, which exercises the full construct tree (including
+`ApiStack`) without the environment lookup:
 
 ```
-cdk synth --app "<venv>/bin/python app.py" RecipeMate-Staging-PipelineOidc \
-  -c createOidcProvider=false -c githubRepo=owner/recipemate
+cd infra && <venv>/bin/python app.py   # calls app.synth()
 ```
 
-Result: **exit 0**. Trust policy renders
-`token.actions.githubusercontent.com:sub: repo:owner/recipemate:ref:refs/heads/main`,
-`Federated: arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com`,
-and `MaxSessionDuration: 3600`.
+Result: **exit 0**. This wrote every stack template to `infra/cdk.out/`,
+including `RecipeMate-Staging-Api.template.json`, so the Api wiring was
+inspected directly (below).
 
-Baseline whole-app synth (before edits), documented fallback:
+### Api template inspection (from `infra/cdk.out/RecipeMate-Staging-Api.template.json`)
+
+- Container `Secrets` present for all seven names: `SECRET_KEY`,
+  `OPENAI_API_KEY`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`.
+  Every one is a `ValueFrom` **reference** (ARN + `:field::`), never a literal
+  value, and injected via `secrets=` (not `environment=`).
+- `FLASK_ENV` and `PORT` remain plain `Environment` entries.
+- Task role `secretsmanager:GetSecretValue` is **scoped to the specific secret
+  ARNs** — no `Resource: "*"` remains on any GetSecretValue statement (checked
+  programmatically: `ANY STAR: False`). The execution role also carries a
+  scoped GetSecretValue (CDK auto-grants it so the ECS agent can pull the
+  `ecs.Secret` values at launch — expected).
+- `AmazonSSMReadOnlyAccess` managed policy: **0 occurrences** — dropped. The
+  app reads no SSM parameters (verified by grepping `app/` for
+  `boto3.client("ssm")` / `get_parameter` / `ssm.` — no matches).
+
+## (b) Leaked-value grep
 
 ```
-<venv>/bin/python app.py   # calls app.synth()
+grep -rniE "change-me-in-production|sk-[A-Za-z0-9]{10,}" infra/cdk.out/*.template.json
 ```
 
-Result: **exit 0**.
+Result: **no matches** (grep exit 1). No `SECRET_KEY` value, no OpenAI key, and
+no `change-me-in-production` placeholder appears in any synthesized template.
+Secret values resolve at task start from Secrets Manager references only.
 
-### Note on `cdk synth --all`
+## (c) Python test suite
 
-`cdk synth --all` for the worktree reports, for `Database`, `Cache`, and `Api`
-only: "Need to perform AWS calls for account 111111111111, but no credentials
-have been configured." This is a pre-existing, environment-dependent VPC/AZ
-**context lookup** that needs either credentials or cached context — it is
-triggered by the region moving to us-east-2 (the pristine main repo, still on
-us-east-1 with cached us-east-1 AZs, synths `--all` clean). It is unrelated to
-`PipelineOidcStack`, which performs no lookups and synths cleanly on its own.
-Once the account is bootstrapped / credentials are present (or `cdk context`
-is populated for us-east-2), `--all` resolves.
+Runner: `<venv>/bin/python -m pytest` from the worktree root (config/auth/unit
+tests use an in-memory SQLite app via `tests/conftest.py`, so no Postgres is
+required and nothing was skipped).
 
-## GitHub-UI follow-ups (cannot be set from in-repo files)
+Full suite:
 
-- Set repo-level GitHub Actions variable `vars.AWS_REGION=us-east-2` (and
-  `vars.VITE_COGNITO_REGION=us-east-2`) in the GitHub UI (TASK-8.1 bullet;
-  TASK-8.4 will retire the Actions deploy path anyway).
-- After deploying `PipelineOidcStack`, create the GitHub secret
-  `AWS_BACKEND_DEPLOY_ROLE_ARN` pointing at the stack's `BackendDeployRoleArn`
-  output.
-- Bootstrap the account for the RecipeMate region: `cdk bootstrap aws://<account>/us-east-2`.
+```
+<venv>/bin/python -m pytest
+# 303 passed in 9.36s
+```
+
+All **303** tests pass (295 pre-existing + 8 new in `tests/test_config.py`).
+None skipped. The new tests cover the TASK-8.3 app-side behaviour:
+
+- `SQLALCHEMY_DATABASE_URI` composed from `DB_*` parts with the password
+  URL-encoded; partial parts fall back to `DATABASE_URL`; local fallback intact.
+- Staging/prod raise `RuntimeError` on an unset/placeholder `SECRET_KEY`; local
+  keeps the permissive default; a real injected key lets staging/prod start.
+
+## Lambda-path confirmation
+
+`lambda/extract_handler.py` `get_openai_api_key()` reads the secret **name**
+from the `OPENAI_SECRET_NAME` env var and fetches the value at runtime via
+`boto3.client("secretsmanager").get_secret_value(...)`, reading the
+`OPENAI_SECRET_JSON_KEY` (default `OPENAI_API_KEY`) field. `QueueStack` sets
+`OPENAI_SECRET_NAME` to `recipemate/<env>/openai-api-key` — the same secret the
+API container now reads for `OPENAI_API_KEY`. The Lambda wiring was read and
+confirmed, not reworked.

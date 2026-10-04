@@ -7,13 +7,14 @@ This document is the reference for every environment variable read by RecipeMate
 | Variable | Description | Example | Required | Local dev notes |
 |----------|-------------|---------|----------|-----------------|
 | FLASK_ENV | Selects the config class: local, staging, or prod. Controls debug mode and logging level. | local | Yes | Leave as local for Docker Compose. |
-| SECRET_KEY | Secret for session signing and CSRF protection. Must be a long random string in all environments. | (generated) | Yes | Generate: python -c "import secrets; print(secrets.token_hex(32))". Never commit. |
+| SECRET_KEY | Secret for session signing and CSRF protection. Must be a long random string in all environments. | (generated) | Yes | Local: generate with python -c "import secrets; print(secrets.token_hex(32))" and never commit. Staging/prod: loaded from Secrets Manager at runtime (see below) — the app refuses to start if it is unset or still the change-me-in-production default. |
 
 ### Database
 
 | Variable | Description | Example | Required | Local dev notes |
 |----------|-------------|---------|----------|-----------------|
-| DATABASE_URL | SQLAlchemy connection string for PostgreSQL. | postgresql+psycopg2://recipemate:recipemate@db:5432/recipemate | Yes | Default points at the db Docker Compose service. Change host/credentials for staging/prod. |
+| DATABASE_URL | SQLAlchemy connection string for PostgreSQL. | postgresql+psycopg2://recipemate:recipemate@db:5432/recipemate | Local/dev | Default points at the db Docker Compose service. In staging/prod the URL is composed from the DB_* parts below (injected from the RDS secret), not from DATABASE_URL. |
+| DB_USER / DB_PASSWORD / DB_HOST / DB_PORT / DB_NAME | Individual RDS connection parts injected from the Secrets Manager DB-credentials secret in staging/prod. The app composes postgresql+psycopg2://user:pass@host:port/dbname from them (password URL-encoded). | (from secret) | Staging/prod | Not set locally — DATABASE_URL is used instead. When these are present they take priority over DATABASE_URL. |
 
 ### Redis
 
@@ -109,3 +110,55 @@ Before the first deploy, bootstrap the target account in the RecipeMate region
 ```
 cdk bootstrap aws://<account-id>/us-east-2
 ```
+
+## Secrets Manager (staging / prod)
+
+In staging and prod, no secret value lives in an env file, a `.env`, or the
+CloudFormation template. The ECS task definition injects each secret as a
+container secret (`ecs.Secret.from_secrets_manager`), so values are fetched by
+the ECS agent at task start and resolve into the container's environment at
+runtime. The task role's `secretsmanager:GetSecretValue` is scoped to exactly
+these secret ARNs (OWASP A01, TASK-8.8).
+
+RecipeMate reads three groups of secrets at runtime:
+
+| Secret | Secrets Manager name | Injected as | Who populates the value |
+|--------|----------------------|-------------|-------------------------|
+| OpenAI API key | `recipemate/<env>/openai-api-key` | `OPENAI_API_KEY` | Operator, post-deploy (the CDK-generated value is only a placeholder). |
+| Flask signing key | `recipemate/<env>/flask-secret-key` | `SECRET_KEY` | CDK, at create time (Secrets Manager generates a strong random value that IS the real key — no manual step). |
+| RDS credentials | `<DatabaseStack-name>/db-credentials` | `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME` | RDS, when the instance is created. The app composes `SQLALCHEMY_DATABASE_URI` from these parts. |
+
+### Flask SECRET_KEY — generated, no manual step
+
+`SecretsStack` creates `recipemate/<env>/flask-secret-key` with a Secrets
+Manager–generated 64-character value under the `SECRET_KEY` JSON key. A signing
+key only needs to be random, so the generated value is used as-is; there is **no**
+`put-secret-value` step. The secret uses `RETAIN` and is not regenerated on
+redeploy, so existing sessions/CSRF tokens stay valid. The app refuses to start
+in staging/prod if `SECRET_KEY` is unset or still the `change-me-in-production`
+default.
+
+### OpenAI API key — populate post-deploy
+
+`SecretsStack` creates `recipemate/<env>/openai-api-key` with a generated
+placeholder (never a real key). Set the real key once after the first deploy:
+
+```
+aws secretsmanager put-secret-value \
+    --secret-id recipemate/<env>/openai-api-key \
+    --secret-string '{"OPENAI_API_KEY":"sk-..."}' \
+    --region us-east-2
+```
+
+Both the API container and the extraction Lambda read the OpenAI key from this
+same secret (the Lambda fetches it at runtime by name via `OPENAI_SECRET_NAME`),
+so one `put-secret-value` covers both.
+
+### Database URL
+
+The RDS secret holds separate `username`/`password`/`host`/`port`/`dbname`
+fields rather than a ready-made URL. `ApiStack` injects those fields as the
+`DB_*` container env vars above and `app/config.py` composes the SQLAlchemy
+connection string from them at runtime (URL-encoding the password). No manual
+step is required; RDS populates the secret. Local development keeps using
+`DATABASE_URL` directly.

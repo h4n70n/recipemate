@@ -72,7 +72,19 @@ queue_stack = QueueStack(
 )
 auth_stack = AuthStack(app, f"{prefix}-Auth", env=cdk_env)
 cache_stack = CacheStack(app, f"{prefix}-Cache", env=cdk_env)
-api_stack = ApiStack(app, f"{prefix}-Api", env=cdk_env)
+# ApiStack reads DATABASE_URL parts, the OpenAI key, and the Flask SECRET_KEY
+# from Secrets Manager at runtime. Threading the ISecret references here
+# (rather than looking them up by name) both wires the ecs.Secret injections
+# and establishes the cross-stack dependency edges, so CloudFormation builds
+# DatabaseStack and SecretsStack before ApiStack.
+api_stack = ApiStack(
+    app,
+    f"{prefix}-Api",
+    env=cdk_env,
+    db_secret=database_stack.secret,
+    openai_secret=secrets_stack.openai_secret,
+    flask_secret=secrets_stack.flask_secret,
+)
 # Static hosting (S3 + CloudFront) for the Vite/React web client. The CI
 # pipeline syncs frontend/dist into this bucket and invalidates the
 # distribution; its outputs (bucket name, distribution id) feed the deploy vars.

@@ -16,6 +16,7 @@ from aws_cdk import (
     aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_iam as iam,
     aws_logs as logs,
+    aws_secretsmanager as secretsmanager,
 )
 from constructs import Construct
 
@@ -36,9 +37,29 @@ class ApiStack(Stack):
       - ``cluster``   – the ECS Cluster.
       - ``service``   – the ECS FargateService.
       - ``api``       – the API Gateway HttpApi.
+
+    Cross-stack references (keyword-only), supplied by ``infra/app.py``:
+      - ``db_secret``     – DatabaseStack's RDS credentials secret. Its JSON has
+        ``username``/``password``/``host``/``port``/``dbname`` fields injected
+        individually (no ready-made URL); ``app/config.py`` composes the
+        SQLAlchemy URL from them at runtime.
+      - ``openai_secret`` – SecretsStack's OpenAI API key secret.
+      - ``flask_secret``  – SecretsStack's Flask ``SECRET_KEY`` secret.
+
+    All three are injected into the container with ``ecs.Secret`` so their
+    values resolve at task start and never appear in the template.
     """
 
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        id: str,
+        *,
+        db_secret: secretsmanager.ISecret | None = None,
+        openai_secret: secretsmanager.ISecret | None = None,
+        flask_secret: secretsmanager.ISecret | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(scope, id, **kwargs)
 
         # ------------------------------------------------------------------ #
@@ -139,18 +160,30 @@ class ApiStack(Stack):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
 
-        # Allow the task to read SSM parameters and Secrets Manager secrets.
-        task_role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name(
-                "AmazonSSMReadOnlyAccess"
+        # Scope Secrets Manager access to exactly the three secrets this task
+        # reads (DB credentials, OpenAI key, Flask signing key) rather than the
+        # broad "*" that was here before — OWASP A01, least privilege
+        # (TASK-8.8). ``grant_read`` below adds the resource-scoped statement
+        # per secret; the explicit statement here keeps the intent visible and
+        # covers only the ARNs that were threaded in. The previous
+        # ``AmazonSSMReadOnlyAccess`` managed policy was dropped: nothing in the
+        # app reads SSM parameters (verified via grep of ``app/``). If an SSM
+        # read is added later, grant it narrowly here rather than reattaching
+        # the broad managed policy.
+        injected_secrets = [
+            secret
+            for secret in (db_secret, openai_secret, flask_secret)
+            if secret is not None
+        ]
+        for secret in injected_secrets:
+            secret.grant_read(task_role)
+        if injected_secrets:
+            task_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[secret.secret_arn for secret in injected_secrets],
+                )
             )
-        )
-        task_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["secretsmanager:GetSecretValue"],
-                resources=["*"],
-            )
-        )
 
         # ------------------------------------------------------------------ #
         # Fargate Task Definition (staging sizing: 256 CPU, 512 MiB)         #
@@ -163,6 +196,49 @@ class ApiStack(Stack):
             execution_role=execution_role,
             task_role=task_role,
         )
+
+        # ------------------------------------------------------------------ #
+        # Container secrets — resolved from Secrets Manager at task start.    #
+        #                                                                     #
+        # Using ``ecs.Secret.from_secrets_manager`` (the ``secrets=`` arg, NOT #
+        # ``environment=``) means the values are fetched by the ECS agent at   #
+        # launch and never rendered into the CloudFormation template or the    #
+        # task definition's plaintext env.                                     #
+        #                                                                      #
+        # The RDS secret has no ready-made URL, so its individual fields are   #
+        # injected as DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME and           #
+        # ``app/config.py`` composes ``postgresql+psycopg2://...`` from them.   #
+        # The field names here MUST match the ones config.py reads.            #
+        # ------------------------------------------------------------------ #
+        container_secrets: dict[str, ecs.Secret] = {}
+        if flask_secret is not None:
+            container_secrets["SECRET_KEY"] = ecs.Secret.from_secrets_manager(
+                flask_secret, field="SECRET_KEY"
+            )
+        if openai_secret is not None:
+            container_secrets["OPENAI_API_KEY"] = (
+                ecs.Secret.from_secrets_manager(
+                    openai_secret, field="OPENAI_API_KEY"
+                )
+            )
+        if db_secret is not None:
+            # RDS-generated secret fields -> individual DB_* env vars. config.py
+            # reads exactly these names to build SQLALCHEMY_DATABASE_URI.
+            container_secrets["DB_USER"] = ecs.Secret.from_secrets_manager(
+                db_secret, field="username"
+            )
+            container_secrets["DB_PASSWORD"] = ecs.Secret.from_secrets_manager(
+                db_secret, field="password"
+            )
+            container_secrets["DB_HOST"] = ecs.Secret.from_secrets_manager(
+                db_secret, field="host"
+            )
+            container_secrets["DB_PORT"] = ecs.Secret.from_secrets_manager(
+                db_secret, field="port"
+            )
+            container_secrets["DB_NAME"] = ecs.Secret.from_secrets_manager(
+                db_secret, field="dbname"
+            )
 
         # Container image — uses the ECR repository built from the Dockerfile.
         container = self._task_definition.add_container(
@@ -179,10 +255,9 @@ class ApiStack(Stack):
                 "FLASK_ENV": "staging",
                 "PORT": "5000",
             },
-            # DATABASE_URL is supplied from Secrets Manager at runtime via the
-            # task role permissions above.  The application reads it from the
-            # environment; the secret value must be injected by the deployment
-            # pipeline or added as a container secret reference.
+            # Sensitive values resolve from Secrets Manager at task start (see
+            # above); none of these ever appears in the template or env file.
+            secrets=container_secrets,
             health_check=ecs.HealthCheck(
                 command=[
                     "CMD-SHELL",
