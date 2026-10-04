@@ -270,6 +270,12 @@ Remaining operator actions (cannot run in this credential-free workspace):
   before the CloudFront distribution can attach it; both the web and API certs
   are DNS-validated, so the validation CNAMEs are written into the existing
   hosted zone automatically.
+- **Deploy ordering (custom auth domain):** when using the optional
+  `auth.recipemate.me` custom domain (`-c authCustomDomain=auth.recipemate.me`),
+  deploy the **Web stack before the Auth stack**. AWS requires an A/AAAA record
+  to already exist at the zone apex (`recipemate.me`) before a Cognito custom
+  domain can be created, and that apex alias record is created by `WebStack`.
+  The default prefix-domain path has no such ordering requirement.
 - `DnsValidatedCertificate` is deprecated in newer aws-cdk-lib but remains the
   pragmatic cross-region (us-east-1-cert-from-a-us-east-2-stack) option at the
   pinned 2.144.0.

@@ -209,6 +209,15 @@ class AuthStack(Stack):
                 region="us-east-1",
                 validation=acm.CertificateValidation.from_dns(zone),
             )
+            # PREREQUISITE / DEPLOY ORDERING: AWS requires an A (or AAAA)
+            # record to already exist at the ZONE APEX (``recipemate.me``)
+            # before a Cognito custom domain can be created. That apex alias
+            # record is created by WebStack, and AuthStack intentionally keeps
+            # no cross-stack construct dependency on it (WebStack and AuthStack
+            # stay independent). Deploy WebStack BEFORE AuthStack whenever
+            # ``authCustomDomain`` is used, otherwise this custom-domain create
+            # can fail. The default prefix-domain path below has no such
+            # ordering requirement.
             self._user_pool_domain = self._user_pool.add_domain(
                 "HostedUiDomain",
                 custom_domain=cognito.CustomDomainOptions(
