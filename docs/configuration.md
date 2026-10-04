@@ -111,6 +111,77 @@ Before the first deploy, bootstrap the target account in the RecipeMate region
 cdk bootstrap aws://<account-id>/us-east-2
 ```
 
+## CI/CD pipeline (CodePipeline)
+
+Build + deploy for both the backend and the frontend is owned by a single AWS
+CodePipeline per environment (`RecipeMate-<Env>-Pipeline`, defined in
+`infra/stacks/pipeline_stack.py`, TASK-8.4 / OR-3). GitHub is a source-only
+input via a CodeStar connection; all build/test/deploy work runs inside
+CodeBuild projects that assume scoped IAM roles, so there are **no static AWS
+keys** anywhere in the pipeline.
+
+The old `deploy-frontend.yml` GitHub Actions deploy job has been retired to a
+credential-free PR build-check; the frontend deploy path now lives in this
+pipeline, not in GitHub Actions.
+
+### CodeStar GitHub connection
+
+The pipeline's Source stage uses an AWS CodeStar GitHub connection on `main`.
+The operator creates this connection **once** in the AWS console or CLI and
+completes the GitHub handshake so its status is `AVAILABLE`, then supplies its
+ARN to the Pipeline stack via CDK context:
+
+- `-c codestarConnectionArn=<arn>`: the CodeStar connection ARN (format
+  `arn:aws:codestar-connections:us-east-2:<account>:connection/<uuid>`). A
+  documented placeholder is used when the context is absent so `cdk synth`
+  works without it, but a real `AVAILABLE` connection is required to deploy.
+- `-c githubRepo=h4n70n/recipemate`: the `owner/name` repo the source action
+  reads (defaults to the placeholder `your-org/recipemate`).
+
+### Frontend build config via SSM Parameter Store
+
+The frontend CodeBuild project reads the Vite build-time config from SSM
+Parameter Store (type `PARAMETER_STORE`) rather than from GitHub Actions `vars`.
+The operator seeds one string parameter per value, per environment, under the
+prefix `/recipemate/<env>/frontend/` (where `<env>` is `staging` or `prod`):
+
+| SSM parameter name | Vite variable |
+|--------------------|---------------|
+| `/recipemate/<env>/frontend/VITE_API_BASE_URL` | `VITE_API_BASE_URL` |
+| `/recipemate/<env>/frontend/VITE_COGNITO_USER_POOL_ID` | `VITE_COGNITO_USER_POOL_ID` |
+| `/recipemate/<env>/frontend/VITE_COGNITO_CLIENT_ID` | `VITE_COGNITO_CLIENT_ID` |
+| `/recipemate/<env>/frontend/VITE_COGNITO_DOMAIN` | `VITE_COGNITO_DOMAIN` |
+| `/recipemate/<env>/frontend/VITE_COGNITO_REGION` | `VITE_COGNITO_REGION` |
+| `/recipemate/<env>/frontend/VITE_REDIRECT_SIGN_IN` | `VITE_REDIRECT_SIGN_IN` |
+| `/recipemate/<env>/frontend/VITE_REDIRECT_SIGN_OUT` | `VITE_REDIRECT_SIGN_OUT` |
+
+The frontend build role is scoped to `ssm:GetParameters` on exactly these
+parameter ARNs. These values **moved off** the GitHub Actions `vars.*` the
+retired `deploy-frontend.yml` deploy job used; after the CodePipeline frontend
+stage is proven in staging, the operator can remove the now-unused GitHub vars.
+
+### Deploy runbook
+
+1. Create the CodeStar GitHub connection once and complete the GitHub handshake
+   so its status is `AVAILABLE`; note its ARN.
+2. Bootstrap the target account in the RecipeMate region (if not already done):
+
+   ```
+   cdk bootstrap aws://<account-id>/us-east-2
+   ```
+
+3. Seed the `VITE_*` SSM parameters listed above for the target env.
+4. Deploy the Pipeline stack, passing the repo and connection ARN:
+
+   ```
+   cdk deploy RecipeMate-<Env>-Pipeline \
+       -c githubRepo=h4n70n/recipemate \
+       -c codestarConnectionArn=<arn>
+   ```
+
+A merge to `main` then builds + tests + deploys automatically for staging; the
+prod pipeline gates the deploys behind a manual approval.
+
 ## Secrets Manager (staging / prod)
 
 In staging and prod, no secret value lives in an env file, a `.env`, or the

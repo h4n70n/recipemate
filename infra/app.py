@@ -23,6 +23,7 @@ from stacks.auth_stack import AuthStack
 from stacks.cache_stack import CacheStack
 from stacks.database_stack import DatabaseStack
 from stacks.pipeline_oidc_stack import PipelineOidcStack
+from stacks.pipeline_stack import PipelineStack
 from stacks.queue_stack import QueueStack
 from stacks.secrets_stack import SecretsStack
 from stacks.storage_stack import StorageStack
@@ -95,6 +96,32 @@ web_stack = WebStack(app, f"{prefix}-Web", env=cdk_env)
 # createOidcProvider); the role ARN is emitted for the GitHub secret.
 pipeline_oidc_stack = PipelineOidcStack(
     app, f"{prefix}-PipelineOidc", env=cdk_env
+)
+# Unified CI/CD CodePipeline (OR-3 / TASK-8.4): ONE pipeline per env that builds
+# and deploys BOTH backend and frontend from a single GitHub source (CodeStar
+# connection on main). Threading the ApiStack ECR repo + cluster + service,
+# WebStack bucket + distribution, and the Database/Secrets secret references as
+# keyword-only args both wires the deploy-time resources and establishes the
+# cross-stack dependency edges, so CloudFormation builds those stacks first. The
+# CodeStar connection ARN is supplied via `-c codestarConnectionArn=...` (the
+# operator creates the GitHub connection once); a documented placeholder lets
+# synth run without it.
+pipeline_stack = PipelineStack(
+    app,
+    f"{prefix}-Pipeline",
+    env=cdk_env,
+    env_name=config.name,
+    ecr_repo=api_stack.ecr_repo,
+    cluster=api_stack.cluster,
+    service=api_stack.service,
+    task_definition=api_stack.task_definition,
+    task_role=api_stack.task_role,
+    execution_role=api_stack.execution_role,
+    web_bucket=web_stack.bucket,
+    web_distribution=web_stack.distribution,
+    db_secret=database_stack.secret,
+    flask_secret=secrets_stack.flask_secret,
+    openai_secret=secrets_stack.openai_secret,
 )
 
 app.synth()
