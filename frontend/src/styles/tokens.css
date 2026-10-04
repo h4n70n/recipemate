@@ -1,0 +1,124 @@
+/**
+ * RecipeMate design tokens — from docs/web-ui-spec.md section 3.
+ * TASK-6.2 screens build against these CSS variables.
+ */
+:root {
+  /* Colors */
+  --color-primary: #e8562a; /* warm terracotta — CTAs, active states */
+  --color-surface: #ffffff; /* cards */
+  --color-surface-cream: #faf7f2; /* app background */
+  --color-text-primary: #1f1b16;
+  --color-text-secondary: #6b6258; /* metadata, captions */
+  --color-success: #2e7d32; /* extraction complete */
+  --color-warning: #c77700; /* extraction processing */
+  --color-error: #c62828; /* extraction failed, validation */
+  --color-rating: var(--color-primary); /* filled stars */
+
+  /* Radius */
+  --radius-card: 12px;
+  --radius-input: 8px;
+  --radius-pill: 999px; /* tags */
+
+  /* Spacing — 4px grid */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* Typography */
+  --font-display: "Fraunces", Georgia, "Times New Roman", serif; /* titles */
+  --font-body: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  /* Breakpoints (reference values for layout) */
+  --bp-mobile: 375px;
+  --bp-tablet: 768px;
+  --bp-desktop: 1280px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  color: var(--color-text-primary);
+  background: var(--color-surface-cream);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
+a {
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Animations used by loading states (TASK-6.2). */
+@keyframes rm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes rm-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: 0 0;
+  }
+}
+
+/* Responsive recipe grid (web-ui-spec §5.2): 4-up desktop, 2-up tablet,
+   1-up mobile. */
+.rm-recipe-grid {
+  display: grid;
+  gap: var(--space-4);
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+
+@media (min-width: 768px) {
+  .rm-recipe-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1280px) {
+  .rm-recipe-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+/* Library layout: filter sidebar + results. Stacks on mobile. */
+.rm-library-layout {
+  display: grid;
+  gap: var(--space-6);
+  grid-template-columns: 1fr;
+  align-items: start;
+}
+
+@media (min-width: 768px) {
+  .rm-library-layout {
+    grid-template-columns: 260px 1fr;
+  }
+}
