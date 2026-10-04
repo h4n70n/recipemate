@@ -1,0 +1,110 @@
+name: Deploy Frontend
+
+# Trigger on:
+#   - push to main that touches frontend/** -> build + deploy
+#   - pull_request touching frontend/**      -> build check only (no deploy)
+#   - manual dispatch                        -> build + deploy on demand
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-frontend.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-frontend.yml"
+  workflow_dispatch:
+
+# Least-privilege default; the deploy job needs id-token to assume the AWS
+# role via OIDC. contents:read is enough to check out the repo.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: frontend
+
+jobs:
+  # ------------------------------------------------------------------------ #
+  # PR build check — typecheck + build, no AWS credentials, no deploy.       #
+  # Runs only for pull_request events.                                        #
+  # ------------------------------------------------------------------------ #
+  build-check:
+    name: Build check (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+  # ------------------------------------------------------------------------ #
+  # Deploy — build, sync to S3, invalidate CloudFront. Runs on push to main  #
+  # and manual dispatch. Uses OIDC role assumption (no static AWS keys).     #
+  # ------------------------------------------------------------------------ #
+  deploy:
+    name: Build and deploy
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC federation with AWS
+      contents: read
+    env:
+      # Build-time Vite config, sourced from GitHub Actions variables/secrets.
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+      VITE_COGNITO_USER_POOL_ID: ${{ vars.VITE_COGNITO_USER_POOL_ID }}
+      VITE_COGNITO_CLIENT_ID: ${{ vars.VITE_COGNITO_CLIENT_ID }}
+      VITE_COGNITO_DOMAIN: ${{ vars.VITE_COGNITO_DOMAIN }}
+      VITE_COGNITO_REGION: ${{ vars.VITE_COGNITO_REGION }}
+      VITE_REDIRECT_SIGN_IN: ${{ vars.VITE_REDIRECT_SIGN_IN }}
+      VITE_REDIRECT_SIGN_OUT: ${{ vars.VITE_REDIRECT_SIGN_OUT }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Sync build to S3
+        run: aws s3 sync dist "s3://${{ vars.FRONTEND_BUCKET }}" --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.FRONTEND_DISTRIBUTION_ID }}" \
+            --paths "/*"

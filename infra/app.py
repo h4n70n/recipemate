@@ -25,6 +25,7 @@ from stacks.database_stack import DatabaseStack
 from stacks.queue_stack import QueueStack
 from stacks.secrets_stack import SecretsStack
 from stacks.storage_stack import StorageStack
+from stacks.web_stack import WebStack
 
 app = cdk.App()
 
@@ -71,5 +72,9 @@ queue_stack = QueueStack(
 auth_stack = AuthStack(app, f"{prefix}-Auth", env=cdk_env)
 cache_stack = CacheStack(app, f"{prefix}-Cache", env=cdk_env)
 api_stack = ApiStack(app, f"{prefix}-Api", env=cdk_env)
+# Static hosting (S3 + CloudFront) for the Vite/React web client. The CI
+# pipeline syncs frontend/dist into this bucket and invalidates the
+# distribution; its outputs (bucket name, distribution id) feed the deploy vars.
+web_stack = WebStack(app, f"{prefix}-Web", env=cdk_env)
 
 app.synth()
