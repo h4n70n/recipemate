@@ -9,13 +9,30 @@ secret) so it can be used safely from mobile and SPA clients.
 Sign in with Apple is wired conditionally from CDK context so the stack can be
 synthesised without Apple credentials present (see the identity-provider section
 below).
+
+OR-9 (Domain & DNS) sets up the Cognito hosted-UI domain and points the OAuth
+redirect URLs at the real domain. The hosted-UI domain DEFAULTS to a Cognito
+PREFIX domain (``<prefix>.auth.<region>.amazoncognito.com``) for a simpler first
+cut: a prefix domain needs no extra us-east-1 certificate and no prerequisite
+root A record (a Cognito CUSTOM domain requires both an A record at the apex and
+a us-east-1 cert before it can be created). A custom ``auth.<domain>`` is still
+available by supplying the ``authCustomDomain`` context key, in which case the
+stack issues its own us-east-1 DNS-validated certificate and adds a Route 53 A
+alias record. The callback/logout URLs default to ``https://<domain>/callback``
+and ``https://<domain>/logout`` while still honouring ``-c callbackUrls`` /
+``-c logoutUrls`` overrides (leaving room for additional iOS redirect URIs).
 """
 from __future__ import annotations
+
+import re
 
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
+    aws_certificatemanager as acm,
     aws_cognito as cognito,
+    aws_route53 as route53,
+    aws_route53_targets as targets,
 )
 from constructs import Construct
 
@@ -31,10 +48,14 @@ class AuthStack(Stack):
         openid/email/profile scopes.
       - (Optional) a Sign in with Apple identity provider, wired only when the
         required Apple credentials are supplied via CDK context.
+      - A Cognito hosted-UI domain: a prefix domain by default, or a custom
+        ``auth.<domain>`` domain (with its own us-east-1 cert + Route 53 alias)
+        when the ``authCustomDomain`` context key is supplied.
 
     Properties exposed for other stacks:
       - ``user_pool``        – the Cognito UserPool.
       - ``user_pool_client`` – the public UserPoolClient.
+      - ``user_pool_domain`` – the Cognito UserPoolDomain (hosted UI).
     """
 
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
@@ -111,13 +132,17 @@ class AuthStack(Stack):
         # App Client — public (no secret) for mobile/web clients             #
         # ------------------------------------------------------------------ #
         # Callback and logout URLs are configurable via CDK context so each
-        # environment can register its own frontend origins. Defaults point at
-        # a local development server.
+        # environment can register its own frontend origins (and additional iOS
+        # redirect URIs). When no override is supplied they default to the real
+        # domain (OR-9): ``https://<domain>/callback`` and
+        # ``https://<domain>/logout``. ``domainName`` is published by app.py; a
+        # documented fallback keeps synth working if the key is absent.
+        domain_name = self.node.try_get_context("domainName") or "recipemate.me"
         callback_urls = self.node.try_get_context("callbackUrls") or [
-            "https://localhost:3000/callback"
+            f"https://{domain_name}/callback"
         ]
         logout_urls = self.node.try_get_context("logoutUrls") or [
-            "https://localhost:3000/logout"
+            f"https://{domain_name}/logout"
         ]
 
         # Supported identity providers: always Cognito; add Apple when wired.
@@ -156,6 +181,78 @@ class AuthStack(Stack):
             self._user_pool_client.node.add_dependency(self._apple_provider)
 
         # ------------------------------------------------------------------ #
+        # Hosted-UI domain (OR-9)                                             #
+        # ------------------------------------------------------------------ #
+        # Default: a Cognito PREFIX domain. It is the simpler first cut — no
+        # extra us-east-1 certificate and no prerequisite root A record (both
+        # of which a Cognito CUSTOM domain requires). Supplying the
+        # ``authCustomDomain`` context key switches to a custom
+        # ``auth.<domain>`` domain with its own us-east-1 DNS-validated cert and
+        # a Route 53 A alias record.
+        auth_custom_domain = self.node.try_get_context("authCustomDomain")
+
+        if auth_custom_domain:
+            # Reference the EXISTING hosted zone (AWS context lookup, needs
+            # credentials at synth time) — never create a second zone.
+            zone = route53.HostedZone.from_lookup(
+                self, "HostedZone", domain_name=domain_name
+            )
+            # Cognito custom-domain certificates MUST be in us-east-1 regardless
+            # of this stack's us-east-2 region. DnsValidatedCertificate is
+            # deprecated in newer aws-cdk-lib but is the pragmatic cross-region
+            # option in the pinned 2.144.0; DNS validation gives auto-renewal.
+            auth_certificate = acm.DnsValidatedCertificate(
+                self,
+                "AuthCertificate",
+                domain_name=auth_custom_domain,
+                hosted_zone=zone,
+                region="us-east-1",
+                validation=acm.CertificateValidation.from_dns(zone),
+            )
+            # PREREQUISITE / DEPLOY ORDERING: AWS requires an A (or AAAA)
+            # record to already exist at the ZONE APEX (``recipemate.me``)
+            # before a Cognito custom domain can be created. That apex alias
+            # record is created by WebStack, and AuthStack intentionally keeps
+            # no cross-stack construct dependency on it (WebStack and AuthStack
+            # stay independent). Deploy WebStack BEFORE AuthStack whenever
+            # ``authCustomDomain`` is used, otherwise this custom-domain create
+            # can fail. The default prefix-domain path below has no such
+            # ordering requirement.
+            self._user_pool_domain = self._user_pool.add_domain(
+                "HostedUiDomain",
+                custom_domain=cognito.CustomDomainOptions(
+                    domain_name=auth_custom_domain,
+                    certificate=auth_certificate,
+                ),
+            )
+            # Alias the auth subdomain at the Cognito user-pool domain.
+            route53.ARecord(
+                self,
+                "AuthAliasRecord",
+                zone=zone,
+                record_name=auth_custom_domain.replace(f".{domain_name}", ""),
+                target=route53.RecordTarget.from_alias(
+                    targets.UserPoolDomainTarget(self._user_pool_domain)
+                ),
+            )
+        else:
+            # Prefix domain. The prefix must be lowercase and may contain only
+            # alphanumerics and hyphens; sanitize the context value (defaulting
+            # to the stack name) so an operator-supplied value cannot produce an
+            # invalid domain prefix.
+            raw_prefix = (
+                self.node.try_get_context("cognitoDomainPrefix")
+                or self.stack_name.lower()
+            )
+            prefix = re.sub(r"[^a-z0-9-]", "-", raw_prefix.lower()).strip("-")
+            self._user_pool_domain = self._user_pool.add_domain(
+                "HostedUiDomain",
+                cognito_domain=cognito.CognitoDomainOptions(
+                    domain_prefix=prefix,
+                ),
+            )
+
+        # ------------------------------------------------------------------ #
         # Outputs                                                             #
         # ------------------------------------------------------------------ #
         cdk.CfnOutput(
@@ -172,6 +269,16 @@ class AuthStack(Stack):
             description="Cognito User Pool App Client ID",
         )
 
+        # Hosted-UI base URL. ``base_url()`` returns the full
+        # ``https://<domain>.auth.<region>.amazoncognito.com`` for a prefix
+        # domain, or ``https://<custom-domain>`` for a custom domain.
+        cdk.CfnOutput(
+            self,
+            "UserPoolDomainBaseUrl",
+            value=self._user_pool_domain.base_url(),
+            description="Cognito hosted-UI base URL (OR-9)",
+        )
+
     # ---------------------------------------------------------------------- #
     # Public properties                                                       #
     # ---------------------------------------------------------------------- #
@@ -185,3 +292,8 @@ class AuthStack(Stack):
     def user_pool_client(self) -> cognito.UserPoolClient:
         """The public User Pool App Client (no client secret)."""
         return self._user_pool_client
+
+    @property
+    def user_pool_domain(self) -> cognito.UserPoolDomain:
+        """The Cognito hosted-UI domain (prefix domain by default)."""
+        return self._user_pool_domain

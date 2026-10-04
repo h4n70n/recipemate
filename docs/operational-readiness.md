@@ -218,25 +218,67 @@ Proposed name plan:
   than the default Cognito domain for OAuth redirects).
 
 Tasks:
-- [ ] Reference the existing hosted zone in CDK (`HostedZone.from_lookup` for
-      `recipemate.me`) — do not create a second zone.
-- [ ] **Web cert (us-east-1):** issue a DNS-validated ACM cert for `recipemate.me`
-      + `www.recipemate.me` in us-east-1 for CloudFront.
-- [ ] **Web distribution:** add `domain_names` + the cert to `WebStack`'s
-      distribution; add Route 53 A/AAAA alias records → CloudFront.
-- [ ] **API cert (us-east-2):** issue a regional ACM cert for `api.recipemate.me`.
-- [ ] **API custom domain:** add an API Gateway v2 `DomainName` + API mapping on
-      `ApiStack`; Route 53 alias `api.recipemate.me` → the API domain.
-- [ ] **Cognito domain:** set a Hosted UI domain (`auth.recipemate.me` with its
-      own us-east-1 cert, or the default Cognito prefix domain if preferred).
-- [ ] **Redirect URLs:** update `AuthStack` callback/logout URLs to
-      `https://recipemate.me/callback` and `/logout`; update the GitHub Actions
+- [x] Reference the existing hosted zone in CDK (`HostedZone.from_lookup` for
+      `recipemate.me`); do not create a second zone. Done in `WebStack` and
+      `ApiStack` (and `AuthStack` when a custom auth domain is requested).
+- [x] **Web cert (us-east-1):** issue a DNS-validated ACM cert for `recipemate.me`
+      + `www.recipemate.me` in us-east-1 for CloudFront. Done in `WebStack` via
+      `acm.DnsValidatedCertificate(..., region="us-east-1")`.
+- [x] **Web distribution:** add `domain_names` + the cert to `WebStack`'s
+      distribution; add Route 53 A/AAAA alias records to CloudFront. Done
+      (apex + `www`, both A and AAAA).
+- [x] **API cert (us-east-2):** issue a regional ACM cert for `api.recipemate.me`.
+      Done in `ApiStack` via `acm.Certificate` in the stack's own region.
+- [x] **API custom domain:** add an API Gateway v2 `DomainName` + API mapping on
+      `ApiStack`; Route 53 alias `api.recipemate.me` to the API domain. Done
+      (`default_domain_mapping` + an A alias to the regional domain).
+- [x] **Cognito domain:** set a Hosted UI domain. Done, defaulting to a Cognito
+      prefix domain (`recipemate-<env>`); `auth.recipemate.me` (with its own
+      us-east-1 cert + alias) is available via the `authCustomDomain` context key.
+- [x] **Redirect URLs:** `AuthStack` callback/logout URLs now default to
+      `https://recipemate.me/callback` and `/logout` (still overridable via
+      `-c callbackUrls` / `-c logoutUrls`). The GitHub Actions
       `VITE_REDIRECT_SIGN_IN` / `VITE_REDIRECT_SIGN_OUT` / `VITE_COGNITO_DOMAIN`
-      vars and `VITE_API_BASE_URL` to `https://api.recipemate.me`.
+      vars and `VITE_API_BASE_URL` are operator value-updates to the
+      already-seeded `/recipemate/<env>/frontend/` SSM params (see
+      `docs/configuration.md`).
 - [ ] **Email (optional):** if transactional email uses this domain, add SES
-      domain verification + DKIM/SPF/DMARC records in the zone.
-- [ ] Confirm cert auto-renewal (DNS validation) and that WAF (OR-5) attaches to
-      the aliased CloudFront distribution.
+      domain verification + DKIM/SPF/DMARC records in the zone. Not started /
+      out of scope for this task.
+- [~] Confirm cert auto-renewal (DNS validation) and that WAF (OR-5) attaches to
+      the aliased CloudFront distribution. DNS validation (hence auto-renewal)
+      is wired for every cert; live validation only completes at `cdk deploy`
+      against the real account. WAF attachment is tracked under OR-5.
+
+Remaining operator actions (cannot run in this credential-free workspace):
+- [~] Live DNS validation at deploy: `cdk deploy` performs the hosted-zone
+      lookup and writes the ACM validation CNAMEs; the certs reach `ISSUED`
+      only after that round trip.
+- [~] Update the real `/recipemate/<env>/frontend/` SSM param VALUES to the new
+      domain endpoints (operator value-update; CDK does not write SSM values,
+      see `docs/configuration.md`).
+
+**As implemented:**
+- The default Cognito hosted-UI domain is a **prefix domain**
+  (`recipemate-<env>.auth.<region>.amazoncognito.com`), chosen for a simpler
+  first cut: a prefix domain needs no extra us-east-1 certificate and no
+  prerequisite apex A record. A custom `auth.recipemate.me` is a drop-in via
+  `-c authCustomDomain=auth.recipemate.me`, which issues a us-east-1 cert and an
+  alias record.
+- **Deploy ordering:** the us-east-1 CloudFront certificate is created first
+  (via the DnsValidatedCertificate custom resource) and must reach `ISSUED`
+  before the CloudFront distribution can attach it; both the web and API certs
+  are DNS-validated, so the validation CNAMEs are written into the existing
+  hosted zone automatically.
+- **Deploy ordering (custom auth domain):** when using the optional
+  `auth.recipemate.me` custom domain (`-c authCustomDomain=auth.recipemate.me`),
+  deploy the **Web stack before the Auth stack**. AWS requires an A/AAAA record
+  to already exist at the zone apex (`recipemate.me`) before a Cognito custom
+  domain can be created, and that apex alias record is created by `WebStack`.
+  The default prefix-domain path has no such ordering requirement.
+- `DnsValidatedCertificate` is deprecated in newer aws-cdk-lib but remains the
+  pragmatic cross-region (us-east-1-cert-from-a-us-east-2-stack) option at the
+  pinned 2.144.0.
 
 **Done when:** `https://recipemate.me` serves the web client, `https://api.recipemate.me`
 serves the API over the custom domain, OAuth redirects resolve to the real

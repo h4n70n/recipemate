@@ -14,8 +14,11 @@ from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
+    aws_certificatemanager as acm,
     aws_iam as iam,
     aws_logs as logs,
+    aws_route53 as route53,
+    aws_route53_targets as targets,
     aws_secretsmanager as secretsmanager,
 )
 from constructs import Construct
@@ -31,6 +34,14 @@ class ApiStack(Stack):
       - An ECS Fargate service with auto-scaling targeting 70% CPU utilisation.
       - An Application Load Balancer (internet-facing) in front of the service.
       - An API Gateway HTTP API that proxies all traffic to the ALB.
+      - (OR-9) A regional (us-east-2) DNS-validated ACM certificate for
+        ``api.recipemate.me``, an API Gateway v2 custom ``DomainName`` wired as
+        the HTTP API's default domain mapping, and a Route 53 A alias record
+        pointing ``api.recipemate.me`` at that custom domain. The certificate is
+        issued in this stack's own region (NOT us-east-1): API Gateway v2
+        regional custom domains require a cert in the same region as the API,
+        unlike CloudFront which needs us-east-1. DNS validation (records written
+        into the looked-up zone) gives automatic certificate renewal.
 
     Properties exposed for other stacks:
       - ``ecr_repo``  – the ECR Repository.
@@ -384,6 +395,42 @@ class ApiStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # OR-9 — API custom domain: zone lookup + regional ACM cert          #
+        # ------------------------------------------------------------------ #
+        # Apex domain is context-driven (app.py publishes ``domainName``) with
+        # a documented fallback so synth logic never crashes when absent. The
+        # API is served at ``api.<domainName>``.
+        domain_name = self.node.try_get_context("domainName") or "recipemate.me"
+        api_domain = f"api.{domain_name}"
+
+        # Reference the EXISTING hosted zone — never create a second zone. This
+        # is an AWS context lookup that needs account credentials at synth time.
+        zone = route53.HostedZone.from_lookup(
+            self, "HostedZone", domain_name=domain_name
+        )
+
+        # Regional certificate: API Gateway v2 regional custom domains require
+        # the cert in the SAME region as the API (this us-east-2 stack), so we
+        # use the standard ``acm.Certificate`` with no ``region=`` override
+        # (contrast CloudFront, which needs a us-east-1 cert). DNS validation
+        # (records written into ``zone``) gives automatic certificate renewal.
+        api_certificate = acm.Certificate(
+            self,
+            "ApiCertificate",
+            domain_name=api_domain,
+            validation=acm.CertificateValidation.from_dns(zone),
+        )
+
+        # API Gateway v2 custom domain. Attached below as the HTTP API's default
+        # domain mapping, which creates the base-path (empty path) API mapping.
+        self._api_domain = apigwv2.DomainName(
+            self,
+            "ApiCustomDomain",
+            domain_name=api_domain,
+            certificate=api_certificate,
+        )
+
+        # ------------------------------------------------------------------ #
         # API Gateway HTTP API → ALB                                         #
         # ------------------------------------------------------------------ #
         alb_integration = apigwv2_integrations.HttpAlbIntegration(
@@ -405,9 +452,32 @@ class ApiStack(Stack):
             description="RecipeMate Flask API via ECS Fargate",
             # Proxy all paths and methods to the ALB.
             default_integration=alb_integration,
+            # OR-9: serve the API on the custom domain at the base path. This
+            # creates the API mapping from api.<domain> to the default stage.
+            default_domain_mapping=apigwv2.DomainMappingOptions(
+                domain_name=self._api_domain,
+            ),
             # CORS is handled by the Flask app; no additional API Gateway CORS
             # configuration needed here.
             cors_preflight=None,
+        )
+
+        # ------------------------------------------------------------------ #
+        # OR-9 — Route 53 alias record (api.<domain> -> custom domain)       #
+        # ------------------------------------------------------------------ #
+        route53.ARecord(
+            self,
+            "ApiAliasRecord",
+            zone=zone,
+            record_name="api",
+            target=route53.RecordTarget.from_alias(
+                targets.ApiGatewayv2DomainProperties(
+                    regional_domain_name=self._api_domain.regional_domain_name,
+                    regional_hosted_zone_id=(
+                        self._api_domain.regional_hosted_zone_id
+                    ),
+                )
+            ),
         )
 
         # ------------------------------------------------------------------ #
@@ -439,6 +509,13 @@ class ApiStack(Stack):
             "ApiEndpoint",
             value=self._api.api_endpoint,
             description="API Gateway HTTP API endpoint URL",
+        )
+
+        cdk.CfnOutput(
+            self,
+            "ApiCustomDomainUrl",
+            value=f"https://{api_domain}",
+            description="API Gateway custom domain URL (OR-9)",
         )
 
     # ---------------------------------------------------------------------- #
