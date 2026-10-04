@@ -1,23 +1,42 @@
-name: Deploy Frontend
+name: Frontend Build Check
 
-# Trigger on:
-#   - push to main that touches frontend/** -> build + deploy
-#   - pull_request touching frontend/**      -> build check only (no deploy)
-#   - manual dispatch                        -> build + deploy on demand
+# PR build-check ONLY. This workflow no longer deploys the frontend.
+#
+# As of 2025 (TASK-8.4 / OR-3) frontend build + deploy is owned by the unified
+# AWS CodePipeline defined in infra/stacks/pipeline_stack.py (the
+# RecipeMate-<Env>-Pipeline stack). GitHub is a source-only input to that
+# pipeline via a CodeStar connection; all build/test/deploy work runs inside
+# CodeBuild projects that assume scoped IAM roles, so there are no static AWS
+# keys or OIDC role assumptions in GitHub Actions anymore.
+#
+# What this workflow does now: on a pull_request that touches the frontend it
+# runs `npm ci && npm run typecheck && npm run build` with no AWS credentials,
+# so a bad merge is caught before it reaches `main` (and therefore the
+# CodePipeline). It intentionally does NOT run on push to `main` and does NOT
+# deploy.
+#
+# The old `deploy` job (push/workflow_dispatch -> AWS OIDC role assumption ->
+# s3 sync -> CloudFront invalidation) has been removed. Keeping the build-check
+# avoids a window with no frontend-build safety net while the CodePipeline
+# frontend stage is being proven.
+#
+# Operator cleanup (do NOT do this yet): once the CodePipeline frontend stage is
+# proven in staging, remove the now-unused GitHub Actions deploy vars/secrets
+# (the deploy role ARN, frontend bucket, frontend distribution id, region, and
+# the VITE_* vars). Those VITE_* build values now live in SSM Parameter Store
+# under /recipemate/<env>/frontend/ (see docs/configuration.md). Do not delete
+# them before the pipeline is proven, to avoid a no-working-deploy window.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "frontend/**"
-      - ".github/workflows/deploy-frontend.yml"
+  # Build-check on PRs that touch the frontend. workflow_dispatch allows a
+  # manual build-check run on demand. No push trigger -> no deploy on merge.
   pull_request:
     paths:
       - "frontend/**"
       - ".github/workflows/deploy-frontend.yml"
   workflow_dispatch:
 
-# Least-privilege default; the deploy job needs id-token to assume the AWS
-# role via OIDC. contents:read is enough to check out the repo.
+# Least-privilege: only read access to check out the repo. No OIDC token write
+# permission and no AWS credentials. This workflow never touches AWS.
 permissions:
   contents: read
 
@@ -27,12 +46,10 @@ defaults:
 
 jobs:
   # ------------------------------------------------------------------------ #
-  # PR build check — typecheck + build, no AWS credentials, no deploy.       #
-  # Runs only for pull_request events.                                        #
+  # PR build check: typecheck + build, no AWS credentials, no deploy.         #
   # ------------------------------------------------------------------------ #
   build-check:
     name: Build check (PR)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -53,58 +70,3 @@ jobs:
 
       - name: Build
         run: npm run build
-
-  # ------------------------------------------------------------------------ #
-  # Deploy — build, sync to S3, invalidate CloudFront. Runs on push to main  #
-  # and manual dispatch. Uses OIDC role assumption (no static AWS keys).     #
-  # ------------------------------------------------------------------------ #
-  deploy:
-    name: Build and deploy
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write # required for OIDC federation with AWS
-      contents: read
-    env:
-      # Build-time Vite config, sourced from GitHub Actions variables/secrets.
-      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
-      VITE_COGNITO_USER_POOL_ID: ${{ vars.VITE_COGNITO_USER_POOL_ID }}
-      VITE_COGNITO_CLIENT_ID: ${{ vars.VITE_COGNITO_CLIENT_ID }}
-      VITE_COGNITO_DOMAIN: ${{ vars.VITE_COGNITO_DOMAIN }}
-      VITE_COGNITO_REGION: ${{ vars.VITE_COGNITO_REGION }}
-      VITE_REDIRECT_SIGN_IN: ${{ vars.VITE_REDIRECT_SIGN_IN }}
-      VITE_REDIRECT_SIGN_OUT: ${{ vars.VITE_REDIRECT_SIGN_OUT }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type-check
-        run: npm run typecheck
-
-      - name: Build
-        run: npm run build
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Sync build to S3
-        run: aws s3 sync dist "s3://${{ vars.FRONTEND_BUCKET }}" --delete
-
-      - name: Invalidate CloudFront
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id "${{ vars.FRONTEND_DISTRIBUTION_ID }}" \
-            --paths "/*"
