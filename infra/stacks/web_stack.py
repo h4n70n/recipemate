@@ -7,6 +7,10 @@ recipe *images*. The web client needs its own private S3 bucket for its build
 artifacts, fronted by a dedicated CloudFront distribution. CloudFront serves
 ``index.html`` as the default root object and rewrites 403/404 responses back
 to ``/index.html`` (HTTP 200) so client-side (React Router) deep links resolve.
+
+WebStack also provisions the GitHub-OIDC frontend deploy role whose ARN is the
+``AWS_DEPLOY_ROLE_ARN`` GitHub secret: a least-privilege role that CI assumes to
+``s3 sync`` the build into the web bucket and invalidate the CloudFront cache.
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from aws_cdk import (
     Stack,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_iam as iam,
     aws_s3 as s3,
 )
 from constructs import Construct
@@ -35,16 +40,31 @@ class WebStack(Stack):
         redirects HTTP->HTTPS, applies Price Class 100 (US & Europe), and
         enforces TLS 1.2_2021. 403 and 404 responses are rewritten to
         ``/index.html`` with status 200 so client-side routes deep-link.
+      - A least-privilege frontend deploy role trusted only by this repo on
+        ``main`` via GitHub OIDC. It imports the OIDC provider owned by
+        PipelineOidcStack (never creating a second one) and is scoped to just
+        the S3 ``sync --delete`` actions on the web bucket plus CloudFront
+        invalidation on the distribution.
 
     Properties exposed for other stacks / CI:
-      - ``bucket``       – the S3 Bucket for SPA artifacts (CI syncs into it).
-      - ``distribution`` – the CloudFront Distribution (CI invalidates it).
+      - ``bucket``          – the S3 Bucket for SPA artifacts (CI syncs into it).
+      - ``distribution``    – the CloudFront Distribution (CI invalidates it).
+      - ``web_deploy_role`` – the IAM Role CI assumes via OIDC.
 
     CloudFormation outputs (consumed by the deploy script / GitHub Actions):
       - ``BucketName``             – S3 bucket name  -> ``aws s3 sync`` target.
       - ``DistributionDomainName`` – the public ``d1234.cloudfront.net`` host.
       - ``DistributionId``         – CloudFront id -> ``create-invalidation``.
+      - ``WebDeployRoleArn``       – store as the ``AWS_DEPLOY_ROLE_ARN`` secret.
     """
+
+    #: GitHub's OIDC token issuer.
+    GITHUB_OIDC_URL: str = "https://token.actions.githubusercontent.com"
+    #: Audience AWS STS expects for GitHub OIDC federation.
+    GITHUB_OIDC_AUDIENCE: str = "sts.amazonaws.com"
+    #: Documented placeholder used when ``githubRepo`` context is not supplied,
+    #: so synth never crashes when the optional context is absent.
+    DEFAULT_GITHUB_REPO: str = "your-org/recipemate"
 
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
@@ -132,6 +152,89 @@ class WebStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # Frontend GitHub-OIDC deploy role                                    #
+        # ------------------------------------------------------------------ #
+        # The role CI assumes (via aws-actions/configure-aws-credentials) to run
+        # `aws s3 sync dist s3://<bucket> --delete` and
+        # `aws cloudfront create-invalidation`. Its ARN is the
+        # ``AWS_DEPLOY_ROLE_ARN`` GitHub secret.
+
+        # GitHub repo in ``owner/name`` form, parameterised so each account can
+        # target its own fork without editing source. Falls back to a documented
+        # placeholder so synth works without the context present.
+        github_repo = (
+            self.node.try_get_context("githubRepo") or self.DEFAULT_GITHUB_REPO
+        )
+
+        # Import — never create — the OIDC provider by its well-known ARN. AWS
+        # allows only one OIDC provider per issuer URL per account, and
+        # PipelineOidcStack is that single creator; creating another here would
+        # conflict. WebStack always imports the existing provider.
+        provider_arn = (
+            f"arn:aws:iam::{self.account}:oidc-provider/"
+            "token.actions.githubusercontent.com"
+        )
+        imported_provider = (
+            iam.OpenIdConnectProvider.from_open_id_connect_provider_arn(
+                self, "ImportedGitHubOidcProviderForWeb", provider_arn
+            )
+        )
+
+        # Trust policy — restrict federation to this repo on ``main``. The
+        # ``sub`` condition pins to pushes on ``main`` of the configured repo;
+        # ``aud`` pins the STS audience. These match PipelineOidcStack.
+        oidc_principal = iam.OpenIdConnectPrincipal(
+            imported_provider,
+            conditions={
+                "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": (
+                        self.GITHUB_OIDC_AUDIENCE
+                    ),
+                },
+                "StringLike": {
+                    "token.actions.githubusercontent.com:sub": (
+                        f"repo:{github_repo}:ref:refs/heads/main"
+                    ),
+                },
+            },
+        )
+
+        self._web_deploy_role = iam.Role(
+            self,
+            "WebDeployRole",
+            role_name=f"{self.stack_name}-web-deploy",
+            assumed_by=oidc_principal,
+            description=(
+                "Frontend CI deploy role (S3 sync + CloudFront invalidation) "
+                f"assumed via GitHub OIDC from repo {github_repo} on main"
+            ),
+            max_session_duration=cdk.Duration.hours(1),
+        )
+
+        # Least-privilege S3 access scoped to this bucket only. The grant
+        # helpers together produce s3:ListBucket/GetObject/PutObject (read-write)
+        # on the bucket ARN and ``bucket/*``, plus s3:DeleteObject (for the
+        # ``--delete`` sync). No ``s3:*`` and no ``*`` resources.
+        self._bucket.grant_read_write(self._web_deploy_role)
+        self._bucket.grant_delete(self._web_deploy_role)
+
+        # CloudFront invalidation only, scoped to this distribution's ARN. Note
+        # the empty region segment — CloudFront distribution ARNs are global.
+        self._web_deploy_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CloudFrontInvalidation",
+                actions=[
+                    "cloudfront:CreateInvalidation",
+                    "cloudfront:GetInvalidation",
+                ],
+                resources=[
+                    f"arn:aws:cloudfront::{self.account}:distribution/"
+                    f"{self._distribution.distribution_id}"
+                ],
+            )
+        )
+
+        # ------------------------------------------------------------------ #
         # CloudFormation Outputs                                              #
         # ------------------------------------------------------------------ #
         cdk.CfnOutput(
@@ -156,6 +259,16 @@ class WebStack(Stack):
             description="CloudFront distribution ID (create-invalidation target)",
         )
 
+        cdk.CfnOutput(
+            self,
+            "WebDeployRoleArn",
+            value=self._web_deploy_role.role_arn,
+            description=(
+                "IAM role ARN for CI frontend deploys — store as the "
+                "AWS_DEPLOY_ROLE_ARN GitHub secret"
+            ),
+        )
+
     # ---------------------------------------------------------------------- #
     # Public properties                                                       #
     # ---------------------------------------------------------------------- #
@@ -169,3 +282,8 @@ class WebStack(Stack):
     def distribution(self) -> cloudfront.Distribution:
         """The CloudFront distribution serving the SPA from the S3 bucket."""
         return self._distribution
+
+    @property
+    def web_deploy_role(self) -> iam.Role:
+        """The IAM role CI assumes via GitHub OIDC to deploy the frontend."""
+        return self._web_deploy_role
