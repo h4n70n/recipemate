@@ -162,3 +162,59 @@ fields rather than a ready-made URL. `ApiStack` injects those fields as the
 connection string from them at runtime (URL-encoding the password). No manual
 step is required; RDS populates the secret. Local development keeps using
 `DATABASE_URL` directly.
+
+## Domain & DNS (OR-9): recipemate.me
+
+RecipeMate uses the `recipemate.me` domain, registered in Route 53. The CDK app
+(`WebStack`, `ApiStack`, `AuthStack`) references the existing hosted zone and
+provisions the certificates, custom domains, and alias records; see
+`docs/operational-readiness.md` (OR-9) for the full task breakdown. The live
+endpoints are:
+
+| Name | Serves | Certificate region |
+|------|--------|--------------------|
+| `recipemate.me`, `www.recipemate.me` | Web client (CloudFront) | us-east-1 |
+| `api.recipemate.me` | REST API (API Gateway v2 custom domain) | us-east-2 (regional) |
+| `recipemate-<env>.auth.<region>.amazoncognito.com` | Cognito hosted UI (default prefix domain) | n/a |
+| `auth.recipemate.me` (optional, via `-c authCustomDomain`) | Cognito hosted UI (custom domain) | us-east-1 |
+
+The apex domain is context-driven: `app.py` publishes `domainName`
+(default `recipemate.me`), the OAuth redirect defaults `callbackUrls`
+(`https://recipemate.me/callback`) and `logoutUrls`
+(`https://recipemate.me/logout`), and `cognitoDomainPrefix`
+(`recipemate-<env>`). An explicit `-c callbackUrls` / `-c logoutUrls` is never
+overwritten, so additional iOS redirect URIs can be appended on the command
+line.
+
+### Frontend SSM parameters: operator value-update (NOT written by CDK)
+
+The seven Vite build-time variables the web client needs are stored as SSM
+parameters under `/recipemate/<env>/frontend/` (already seeded in the target
+account by a prior task). **CDK does not write SSM parameter values**; these
+are an operator value-update: after the OR-9 deploy issues the custom domains
+and the user pool, update each parameter to its real value, then rebuild and
+redeploy the frontend (Vite reads them at build time).
+
+| SSM parameter | GitHub Actions var | Real value |
+|---------------|--------------------|-----------|
+| `/recipemate/<env>/frontend/VITE_API_BASE_URL` | `VITE_API_BASE_URL` | `https://api.recipemate.me/v1` (note the `/v1` prefix the frontend appends to every request) |
+| `/recipemate/<env>/frontend/VITE_REDIRECT_SIGN_IN` | `VITE_REDIRECT_SIGN_IN` | `https://recipemate.me/callback` |
+| `/recipemate/<env>/frontend/VITE_REDIRECT_SIGN_OUT` | `VITE_REDIRECT_SIGN_OUT` | `https://recipemate.me/logout` |
+| `/recipemate/<env>/frontend/VITE_COGNITO_DOMAIN` | `VITE_COGNITO_DOMAIN` | the hosted-UI domain host WITHOUT scheme, e.g. `recipemate-<env>.auth.us-east-2.amazoncognito.com` for the default prefix domain, or `auth.recipemate.me` if the custom domain is used |
+| `/recipemate/<env>/frontend/VITE_COGNITO_USER_POOL_ID` | `VITE_COGNITO_USER_POOL_ID` | the `AuthStack` `UserPoolId` output (e.g. `us-east-2_AbCdEfGhI`) |
+| `/recipemate/<env>/frontend/VITE_COGNITO_CLIENT_ID` | `VITE_COGNITO_CLIENT_ID` | the `AuthStack` `UserPoolClientId` output |
+| `/recipemate/<env>/frontend/VITE_COGNITO_REGION` | `VITE_COGNITO_REGION` | `us-east-2` |
+
+`VITE_COGNITO_USER_POOL_ID` / `VITE_COGNITO_CLIENT_ID` come from the `AuthStack`
+CloudFormation outputs; `VITE_COGNITO_DOMAIN` comes from the
+`UserPoolDomainBaseUrl` output (strip the `https://` scheme). Update a parameter
+value with, for example:
+
+```
+aws ssm put-parameter \
+    --name /recipemate/<env>/frontend/VITE_API_BASE_URL \
+    --type String \
+    --overwrite \
+    --value https://api.recipemate.me/v1 \
+    --region us-east-2
+```
