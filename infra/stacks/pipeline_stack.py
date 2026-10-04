@@ -28,10 +28,20 @@ Stage flow (per environment, one pipeline each):
                 deploys automatically; prod waits for a human.
     DeployBackend  -> a CodeBuild project that runs ``alembic upgrade head``
                       (DATABASE_URL composed at runtime from the DatabaseStack
-                      secret, never baked in), rolls the ECS service with
-                      ``--force-new-deployment``, and waits for
-                      ``ecs services-stable`` so the ALB ``/health`` target
-                      group is healthy before the stage succeeds.
+                      secret, never baked in), then pins the deploy to the
+                      *immutable commit-SHA image* the Build stage produced: it
+                      reads ``image-tag.txt`` from the backend build artifact,
+                      pulls the live task definition, rewrites its container
+                      image to ``$ECR_REPO_URI:$IMAGE_TAG``, registers a NEW
+                      task-definition revision, and points the service at that
+                      exact revision with ``aws ecs update-service
+                      --task-definition <newArn>``. It then polls the
+                      deployment's rollout state (with a generous timeout) until
+                      the primary deployment is ``COMPLETED`` and the ALB
+                      ``/health`` target group is healthy. Pinning to the SHA
+                      (rather than force-deploying ``:latest``) keeps every
+                      deploy traceable and rollback-able and removes the race
+                      where two overlapping runs fight over the ``:latest`` tag.
     DeployFrontend -> a CodeBuild project that ``aws s3 sync frontend/dist`` into
                       the WebStack bucket (``--delete``) and creates a CloudFront
                       invalidation on the WebStack distribution.
@@ -90,7 +100,13 @@ class PipelineStack(Stack):
         (e.g. the prod-only manual approval).
       - ``ecr_repo``        – ApiStack ECR repo the backend image is pushed to.
       - ``cluster``         – ApiStack ECS cluster (for the service roll).
-      - ``service``         – ApiStack ECS Fargate service to force-deploy.
+      - ``service``         – ApiStack ECS Fargate service to roll.
+      - ``task_definition`` – ApiStack Fargate task definition; the deploy reads
+        its family and re-registers a new revision pinned to the SHA image.
+      - ``task_role``       – ApiStack ECS task role; ``iam:PassRole`` is scoped
+        to it so the deploy can register a new task-def revision.
+      - ``execution_role``  – ApiStack ECS task execution role; ``iam:PassRole``
+        is scoped to it for the same reason.
       - ``web_bucket``      – WebStack S3 bucket the frontend syncs into.
       - ``web_distribution``– WebStack CloudFront distribution to invalidate.
       - ``db_secret``       – DatabaseStack RDS credentials secret; read at
@@ -133,6 +149,9 @@ class PipelineStack(Stack):
         ecr_repo: ecr.IRepository,
         cluster: ecs.ICluster,
         service: ecs.IBaseService,
+        task_definition: ecs.FargateTaskDefinition,
+        task_role: iam.IRole,
+        execution_role: iam.IRole,
         web_bucket: s3.IBucket,
         web_distribution: cloudfront.IDistribution,
         db_secret: secretsmanager.ISecret,
@@ -403,10 +422,28 @@ class PipelineStack(Stack):
         # ------------------------------------------------------------------ #
         # DATABASE_URL is composed at runtime from the DatabaseStack secret
         # (DB_SECRET_ARN env var -> secretsmanager get-secret-value), never
-        # baked into the template. The service is rolled with
-        # ``--force-new-deployment`` so it pulls the freshly pushed ``latest``
-        # image, then ``ecs wait services-stable`` blocks until the new tasks
-        # pass the ALB ``/health`` target-group check.
+        # baked into the template.
+        #
+        # The rollout pins the service to the IMMUTABLE commit-SHA image the
+        # Build stage pushed, instead of force-deploying ``:latest``:
+        #   1. read $IMAGE_TAG from the backend build artifact's image-tag.txt;
+        #   2. describe the live task definition (family resolved from
+        #      $TASK_DEF_FAMILY) and, with jq, rewrite its single container's
+        #      image to $ECR_REPO_URI:$IMAGE_TAG while stripping the read-only
+        #      fields the register API rejects;
+        #   3. register a NEW task-definition revision and capture its ARN;
+        #   4. point the service at that exact revision with
+        #      ``aws ecs update-service --task-definition <newArn>``.
+        # This makes every deploy traceable to a commit, gives a clean rollback
+        # target (the prior revision), and removes the race where two
+        # overlapping runs clobber the shared ``:latest`` tag.
+        #
+        # ROLLOUT_TIMEOUT_SECONDS replaces ``aws ecs wait services-stable`` —
+        # that waiter has a fixed ~10-minute budget (40 polls x 15s) and would
+        # fail a slow-but-healthy rollout. We poll the service's primary
+        # deployment ``rolloutState`` ourselves until COMPLETED, with a longer
+        # bound that cold Fargate starts (60s health-check start_period + image
+        # pull) comfortably fit inside.
         backend_deploy_project = codebuild.PipelineProject(
             self,
             "BackendDeploy",
@@ -423,6 +460,22 @@ class PipelineStack(Stack):
                 ),
                 "ECS_SERVICE": codebuild.BuildEnvironmentVariable(
                     value=service.service_name
+                ),
+                # Task-def family (not the full ARN) — describe-task-definition
+                # resolves the latest ACTIVE revision from the family name.
+                "TASK_DEF_FAMILY": codebuild.BuildEnvironmentVariable(
+                    value=task_definition.family
+                ),
+                # Container name whose image we rewrite — matches ApiStack.
+                "CONTAINER_NAME": codebuild.BuildEnvironmentVariable(
+                    value="FlaskApiContainer"
+                ),
+                "ECR_REPO_URI": codebuild.BuildEnvironmentVariable(
+                    value=ecr_repo.repository_uri
+                ),
+                # Explicit rollout bound (seconds) for our own poll loop.
+                "ROLLOUT_TIMEOUT_SECONDS": codebuild.BuildEnvironmentVariable(
+                    value="1200"
                 ),
                 "AWS_DEFAULT_REGION": codebuild.BuildEnvironmentVariable(
                     value=self.region
@@ -467,36 +520,136 @@ class PipelineStack(Stack):
                         },
                         "build": {
                             "commands": [
+                                "set -euo pipefail",
                                 "echo Running database migrations...",
                                 "alembic upgrade head",
-                                "echo Rolling the ECS service...",
+                                # ---- Pin the deploy to the immutable SHA tag ---
+                                "echo Resolving the built image tag...",
+                                # image-tag.txt comes from the backend build
+                                # artifact (CODEBUILD_SRC_DIR_BackendBuildOutput
+                                # points at that secondary source root).
+                                'IMAGE_TAG="$(cat '
+                                "$CODEBUILD_SRC_DIR_BackendBuildOutput/"
+                                'image-tag.txt)"',
+                                'NEW_IMAGE="$ECR_REPO_URI:$IMAGE_TAG"',
+                                'echo "Deploying image $NEW_IMAGE"',
+                                "echo Fetching the current task definition...",
+                                (
+                                    "TASK_DEF_JSON=$(aws ecs "
+                                    "describe-task-definition "
+                                    "--task-definition $TASK_DEF_FAMILY "
+                                    "--query taskDefinition)"
+                                ),
+                                # Build the register-task-definition input:
+                                # swap the container image and drop the
+                                # server-managed fields the API rejects.
+                                (
+                                    'NEW_TASK_DEF=$(echo "$TASK_DEF_JSON" | jq '
+                                    '--arg IMAGE "$NEW_IMAGE" '
+                                    '--arg NAME "$CONTAINER_NAME" '
+                                    "'(.containerDefinitions[] | "
+                                    'select(.name == $NAME) | .image) = $IMAGE '
+                                    "| del(.taskDefinitionArn, .revision, "
+                                    ".status, .requiresAttributes, "
+                                    ".compatibilities, .registeredAt, "
+                                    ".registeredBy)')"
+                                ),
+                                "echo Registering the new task definition "
+                                "revision...",
+                                (
+                                    "NEW_TASK_DEF_ARN=$(aws ecs "
+                                    "register-task-definition "
+                                    '--cli-input-json "$NEW_TASK_DEF" '
+                                    "--query taskDefinition.taskDefinitionArn "
+                                    "--output text)"
+                                ),
+                                'echo "Registered $NEW_TASK_DEF_ARN"',
+                                "echo Pointing the service at the new "
+                                "revision...",
                                 (
                                     "aws ecs update-service --cluster "
                                     "$ECS_CLUSTER --service $ECS_SERVICE "
-                                    "--force-new-deployment"
+                                    '--task-definition "$NEW_TASK_DEF_ARN"'
                                 ),
-                                "echo Waiting for the service to stabilise "
+                                # ---- Explicit rollout poll (replaces the ----
+                                # ---- fixed-budget `ecs wait services-stable`) -
+                                "echo Waiting for the deployment to complete "
                                 "(ALB /health must pass)...",
                                 (
-                                    "aws ecs wait services-stable --cluster "
-                                    "$ECS_CLUSTER --services $ECS_SERVICE"
+                                    "DEADLINE=$(( $(date +%s) + "
+                                    "ROLLOUT_TIMEOUT_SECONDS ))"
                                 ),
+                                "while true; do "
+                                "STATE=$(aws ecs describe-services "
+                                "--cluster $ECS_CLUSTER "
+                                "--services $ECS_SERVICE "
+                                "--query \"services[0].deployments[?status=='PRIMARY']"
+                                '.rolloutState | [0]" --output text); '
+                                'echo "rolloutState=$STATE"; '
+                                'if [ "$STATE" = "COMPLETED" ]; then '
+                                'echo "Deployment completed."; break; fi; '
+                                'if [ "$STATE" = "FAILED" ]; then '
+                                'echo "Deployment failed." >&2; exit 1; fi; '
+                                "if [ $(date +%s) -ge $DEADLINE ]; then "
+                                'echo "Timed out after '
+                                '${ROLLOUT_TIMEOUT_SECONDS}s waiting for a '
+                                "stable deployment.\" >&2; exit 1; fi; "
+                                "sleep 15; "
+                                "done",
                             ]
                         },
                     },
                 }
             ),
         )
-        # Least-privilege: read only the DB secret; roll only this service.
+        # Least-privilege: read only the DB secret.
         db_secret.grant_read(backend_deploy_project)
+        # UpdateService is scoped to the one service ARN — the deploy only ever
+        # rolls this service.
         backend_deploy_project.add_to_role_policy(
             iam.PolicyStatement(
                 sid="RollEcsService",
-                actions=[
-                    "ecs:UpdateService",
-                    "ecs:DescribeServices",
-                ],
+                actions=["ecs:UpdateService"],
                 resources=[service.service_arn],
+            )
+        )
+        # DescribeServices is evaluated by IAM at CLUSTER granularity (the
+        # service-ARN form fails for some callers / the rollout poll), so scope
+        # it to the cluster ARN while keeping UpdateService on the service ARN.
+        backend_deploy_project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="DescribeEcsServices",
+                actions=["ecs:DescribeServices"],
+                resources=[cluster.cluster_arn],
+            )
+        )
+        # Registering a new task-def revision pinned to the SHA image requires
+        # DescribeTaskDefinition + RegisterTaskDefinition. The ECS API does NOT
+        # support resource-level permissions for these two actions, so AWS
+        # requires "*" — this is an AWS constraint, not a scope omission.
+        backend_deploy_project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="RegisterTaskDefinition",
+                actions=[
+                    "ecs:DescribeTaskDefinition",
+                    "ecs:RegisterTaskDefinition",
+                ],
+                resources=["*"],
+            )
+        )
+        # register-task-definition carries the task + execution role ARNs, so
+        # the deploy role needs iam:PassRole — scoped to EXACTLY those two
+        # ApiStack roles (not "*"), and only passable to ECS tasks.
+        backend_deploy_project.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="PassEcsTaskRoles",
+                actions=["iam:PassRole"],
+                resources=[task_role.role_arn, execution_role.role_arn],
+                conditions={
+                    "StringEquals": {
+                        "iam:PassedToService": "ecs-tasks.amazonaws.com"
+                    }
+                },
             )
         )
 
