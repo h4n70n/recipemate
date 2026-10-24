@@ -33,10 +33,17 @@ class ApiStack(Stack):
       - An API Gateway HTTP API that proxies all traffic to the ALB.
 
     Properties exposed for other stacks:
-      - ``ecr_repo``  – the ECR Repository.
-      - ``cluster``   – the ECS Cluster.
-      - ``service``   – the ECS FargateService.
-      - ``api``       – the API Gateway HttpApi.
+      - ``ecr_repo``        – the ECR Repository.
+      - ``cluster``         – the ECS Cluster.
+      - ``service``         – the ECS FargateService.
+      - ``api``             – the API Gateway HttpApi.
+      - ``task_definition`` – the Fargate task definition (so the CI pipeline
+        can read its ARN family and re-register a new revision pinned to the
+        immutable commit-SHA image tag).
+      - ``task_role``       – the ECS task role (needed by the pipeline's
+        ``iam:PassRole`` when it registers a new task-def revision).
+      - ``execution_role``  – the ECS task execution role (likewise needed for
+        ``iam:PassRole`` on re-register).
 
     Cross-stack references (keyword-only), supplied by ``infra/app.py``:
       - ``db_secret``     – DatabaseStack's RDS credentials secret. Its JSON has
@@ -140,7 +147,7 @@ class ApiStack(Stack):
         # ------------------------------------------------------------------ #
         # Task Execution Role (allows ECR pulls and CloudWatch log writes)   #
         # ------------------------------------------------------------------ #
-        execution_role = iam.Role(
+        execution_role = self._execution_role = iam.Role(
             self,
             "TaskExecutionRole",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
@@ -154,7 +161,7 @@ class ApiStack(Stack):
         # ------------------------------------------------------------------ #
         # Task Role (application-level AWS permissions)                      #
         # ------------------------------------------------------------------ #
-        task_role = iam.Role(
+        task_role = self._task_role = iam.Role(
             self,
             "TaskRole",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
@@ -464,3 +471,31 @@ class ApiStack(Stack):
     def api(self) -> apigwv2.HttpApi:
         """The API Gateway HTTP API fronting the Fargate service."""
         return self._api
+
+    @property
+    def task_definition(self) -> ecs.FargateTaskDefinition:
+        """The Fargate task definition for the Flask API container.
+
+        The CI pipeline reads this definition's family at deploy time, swaps
+        the container image to the immutable commit-SHA tag, and registers a
+        new revision so each deploy is traceable and rollback-able.
+        """
+        return self._task_definition
+
+    @property
+    def task_role(self) -> iam.Role:
+        """The ECS task role (application-level AWS permissions).
+
+        Exposed so the CI pipeline can scope ``iam:PassRole`` to exactly this
+        role when it registers a new task-definition revision.
+        """
+        return self._task_role
+
+    @property
+    def execution_role(self) -> iam.Role:
+        """The ECS task execution role (ECR pull + CloudWatch logs).
+
+        Exposed so the CI pipeline can scope ``iam:PassRole`` to exactly this
+        role when it registers a new task-definition revision.
+        """
+        return self._execution_role

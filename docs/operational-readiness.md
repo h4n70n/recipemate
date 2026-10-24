@@ -54,25 +54,79 @@ with no static credentials anywhere.
 
 ---
 
-## OR-3 — Backend CI/CD on CodePipeline
+## OR-3 — Unified CI/CD on CodePipeline
 
-Only `deploy-frontend.yml` (GitHub Actions) exists. No backend pipeline builds
-the Docker image, pushes to ECR, or rolls the ECS service. `ApiStack` creates the
-ECR repo and Fargate service but nothing populates `:latest`.
+A single `PipelineStack` (`infra/stacks/pipeline_stack.py`) now owns build +
+deploy for BOTH the backend (Docker image to ECR, ECS rolling deploy) and the
+frontend (SPA build, S3 sync, CloudFront invalidation) from one GitHub source.
+The old `deploy-frontend.yml` GitHub Actions deploy job has been retired to a
+credential-free PR build-check (see "Workflow cutover" below).
 
 Tasks:
-- [ ] Define a `PipelineStack` (CDK): source → build (docker build + push to the
+- [x] Define a `PipelineStack` (CDK): source → build (docker build + push to the
       `ApiStack` ECR repo) → test (pytest) → deploy (ECS rolling update).
-- [ ] Source stage: GitHub connection (CodeStar) on `main`.
-- [ ] Build stage: CodeBuild runs `docker build`, tags with commit SHA + `latest`,
-      pushes to ECR; run migrations (`alembic upgrade head`) as a deploy step.
-- [ ] Deploy stage: update the ECS service to the new image; wait for the ALB
-      `/health` target group to go healthy before marking success.
-- [ ] Manual-approval action before the prod stage.
-- [ ] Decide split: keep frontend on GitHub Actions, or fold it into CodePipeline.
+- [x] Source stage: GitHub connection (CodeStar) on `main`.
+- [x] Build stage: CodeBuild runs `docker build`, tags with commit SHA + `latest`,
+      pushes to ECR; migrations (`alembic upgrade head`) run in the backend
+      deploy stage.
+- [x] Deploy stage: update the ECS service to the new image
+      (`--force-new-deployment`); wait for the service to stabilise
+      (`ecs wait services-stable`) so the ALB `/health` target group is healthy
+      before marking success.
+- [x] Manual-approval action before the prod stage (prod pipeline only; staging
+      deploys automatically).
+- [x] Decide split: resolved. The frontend was folded into CodePipeline (one
+      pipeline per env builds and deploys backend + frontend together).
 
-**Done when:** A merge to `main` builds, tests, pushes the image, migrates, and
-rolls the Fargate service with zero manual steps (prod gated by approval).
+### Stage graph as built
+
+Per environment (`RecipeMate-<Env>-Pipeline`):
+
+1. **Source**: CodeStar GitHub connection on `main`. The operator creates the
+   connection once and passes its ARN via `-c codestarConnectionArn=<arn>`.
+2. **Build** (two CodeBuild projects in parallel):
+   - backend: `docker build` the repo-root Dockerfile, push the commit-SHA tag
+     and `latest` to the `ApiStack` ECR repo (privileged Docker build).
+   - frontend: `npm ci && npm run typecheck && npm run build`, with the `VITE_*`
+     values sourced from SSM Parameter Store (see `docs/configuration.md`); emits
+     `frontend/dist` as the deploy artifact.
+3. **Test**: a CodeBuild project running `pytest`. A red suite fails the stage
+   and halts the pipeline before any deploy.
+4. **Approval** (PROD ONLY): a manual-approval action gating the deploys.
+5. **DeployBackend**: `alembic upgrade head` (DATABASE_URL composed at runtime
+   from the DatabaseStack secret), roll the ECS service, wait for stability.
+6. **DeployFrontend**: `aws s3 sync frontend/dist` (`--delete`) into the WebStack
+   bucket, then a CloudFront invalidation on the WebStack distribution.
+
+### Workflow cutover (`deploy-frontend.yml`)
+
+`.github/workflows/deploy-frontend.yml` is now a credential-free PR build-check
+(`npm ci && typecheck && build` on `pull_request`, `permissions: contents:read`
+only). The deploy job that used `aws-actions/configure-aws-credentials` + OIDC +
+`s3 sync` + CloudFront invalidation has been removed; the workflow no longer runs
+on push to `main`. The build-check is retained so a bad merge is caught before it
+reaches `main` and the CodePipeline. The operator should remove the now-unused
+GitHub vars/secrets (`AWS_DEPLOY_ROLE_ARN`, `FRONTEND_BUCKET`,
+`FRONTEND_DISTRIBUTION_ID`, the `VITE_*` vars) only AFTER the CodePipeline
+frontend stage is proven in staging, to avoid a no-working-deploy window.
+
+### Synth validation note
+
+- [~] This change was validated by **single-stack synth** of the Pipeline stack
+      for both envs (`cdk synth RecipeMate-<Env>-Pipeline ...`), which succeeds
+      with no AWS credentials because the Pipeline stack has no VPC/AZ lookups.
+      A **full-app synth** (all stacks) still requires account credentials
+      because DatabaseStack/CacheStack/ApiStack perform VPC AZ lookups
+      ("Need to perform AWS calls for account ... but no credentials
+      configured"). This is a pre-existing baseline limitation, not caused by
+      this task. Live `cdk bootstrap`/`cdk deploy` and proving the pipeline
+      end-to-end in staging are deferred to the operator (no AWS creds in the
+      build sandbox).
+
+**Done when:** A merge to `main` builds, tests, pushes the image, migrates, rolls
+the Fargate service, and deploys the frontend with zero manual steps (prod gated
+by approval). Remaining to prove live: operator bootstrap + first deploy and the
+staging run (`[~]` above).
 
 ---
 
