@@ -54,6 +54,7 @@ from stacks.api_stack import ApiStack
 from stacks.auth_stack import AuthStack
 from stacks.cache_stack import CacheStack
 from stacks.database_stack import DatabaseStack
+from stacks.monitoring_stack import MonitoringStack
 from stacks.pipeline_oidc_stack import PipelineOidcStack
 from stacks.pipeline_stack import PipelineStack
 from stacks.queue_stack import QueueStack
@@ -177,6 +178,32 @@ pipeline_stack = PipelineStack(
     db_secret=database_stack.secret,
     flask_secret=secrets_stack.flask_secret,
     openai_secret=secrets_stack.openai_secret,
+)
+# OR-6 — centralised CloudWatch alarms, a single alerting SNS topic (DISTINCT
+# from the APNs notifications topic), and an operations dashboard. Instantiated
+# AFTER the stacks it observes (Api/Database/Queue/Cache) so threading their
+# constructs as keyword-only args both resolves the references AND establishes
+# the CloudFormation dependency edges, so those stacks build first. The alert
+# endpoint is context-driven: pass `-c alertEmail=ops@example.com` and/or
+# `-c alertSlackWebhookUrl=https://hooks.slack.com/...`; with neither set the
+# topic is created with no subscription (never a hardcoded real email). This
+# stack is intentionally NOT threaded into PipelineStack: it observes the
+# running resources, it is not part of the build/deploy path.
+monitoring_stack = MonitoringStack(
+    app,
+    f"{prefix}-Monitoring",
+    env=cdk_env,
+    env_name=config.name,
+    fargate_service=api_stack.service,
+    alb=api_stack.alb,
+    target_group=api_stack.target_group,
+    http_api=api_stack.api,
+    db_instance=database_stack.instance,
+    extraction_queue=queue_stack.queue,
+    extraction_dlq=queue_stack.dlq,
+    extraction_lambda=queue_stack.extraction_lambda,
+    dlq_lambda=queue_stack.dlq_lambda,
+    redis_cluster=cache_stack.redis,
 )
 
 app.synth()

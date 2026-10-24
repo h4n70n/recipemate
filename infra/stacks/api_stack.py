@@ -48,6 +48,11 @@ class ApiStack(Stack):
       - ``cluster``         – the ECS Cluster.
       - ``service``         – the ECS FargateService.
       - ``api``             – the API Gateway HttpApi.
+      - ``alb``             – the Application Load Balancer fronting the
+        service (consumed by MonitoringStack/OR-6 for the ELB 5xx alarm).
+      - ``target_group``    – the ALB target group holding the Fargate tasks
+        (consumed by MonitoringStack/OR-6 for unhealthy-host, per-target 5xx,
+        and p95 target-response-time alarms).
       - ``task_definition`` – the Fargate task definition (so the CI pipeline
         can read its ARN family and re-register a new revision pinned to the
         immutable commit-SHA image tag).
@@ -385,7 +390,11 @@ class ApiStack(Stack):
             open=False,  # Security group already permits port 80.
         )
 
-        http_listener.add_targets(
+        # Capture the target group to a field so MonitoringStack (OR-6) can
+        # alarm on it (unhealthy host count, per-target 5xx, p95 response
+        # time). Previously this call's return value was discarded; the target
+        # group is otherwise unreachable from sibling stacks.
+        self._target_group = http_listener.add_targets(
             "FlaskServiceTarget",
             port=5000,
             protocol=elbv2.ApplicationProtocol.HTTP,
@@ -548,6 +557,24 @@ class ApiStack(Stack):
     def api(self) -> apigwv2.HttpApi:
         """The API Gateway HTTP API fronting the Fargate service."""
         return self._api
+
+    @property
+    def alb(self) -> elbv2.ApplicationLoadBalancer:
+        """The internet-facing Application Load Balancer in front of the service.
+
+        Exposed so MonitoringStack (OR-6) can build the load-balancer-level
+        5xx alarm from ``metric_http_code_elb``.
+        """
+        return self._alb
+
+    @property
+    def target_group(self) -> elbv2.ApplicationTargetGroup:
+        """The ALB target group holding the Fargate tasks.
+
+        Exposed so MonitoringStack (OR-6) can alarm on unhealthy host count,
+        per-target 5xx responses, and p95 target response time.
+        """
+        return self._target_group
 
     @property
     def task_definition(self) -> ecs.FargateTaskDefinition:
