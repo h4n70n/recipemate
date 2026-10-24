@@ -11,15 +11,26 @@ to ``/index.html`` (HTTP 200) so client-side (React Router) deep links resolve.
 WebStack also provisions the GitHub-OIDC frontend deploy role whose ARN is the
 ``AWS_DEPLOY_ROLE_ARN`` GitHub secret: a least-privilege role that CI assumes to
 ``s3 sync`` the build into the web bucket and invalidate the CloudFront cache.
+
+OR-9 (Domain & DNS) wires the custom domain onto the distribution: the EXISTING
+``recipemate.me`` hosted zone is referenced via ``HostedZone.from_lookup`` (never
+re-created), a DNS-validated ACM certificate for ``recipemate.me`` +
+``www.recipemate.me`` is issued in **us-east-1** (CloudFront only accepts
+us-east-1 certs), the distribution gets ``domain_names`` + that certificate, and
+Route 53 A + AAAA alias records for the apex and ``www`` point at the
+distribution. DNS validation gives automatic certificate renewal.
 """
 from __future__ import annotations
 
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
+    aws_certificatemanager as acm,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_iam as iam,
+    aws_route53 as route53,
+    aws_route53_targets as targets,
     aws_s3 as s3,
 )
 from constructs import Construct
@@ -104,6 +115,40 @@ class WebStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # OR-9 — custom domain: hosted zone lookup + us-east-1 ACM cert       #
+        # ------------------------------------------------------------------ #
+        # Apex domain is context-driven (app.py publishes ``domainName``) with
+        # a documented fallback so synth logic never crashes when the key is
+        # absent. The one true AWS lookup is ``HostedZone.from_lookup`` below,
+        # which needs account credentials at synth time.
+        domain_name = self.node.try_get_context("domainName") or "recipemate.me"
+        www_domain = f"www.{domain_name}"
+
+        # Reference the EXISTING Route 53 hosted zone — do NOT create a second
+        # zone (AWS registered the domain and provisioned the zone already).
+        zone = route53.HostedZone.from_lookup(
+            self, "HostedZone", domain_name=domain_name
+        )
+
+        # CloudFront only trusts ACM certificates issued in us-east-1, so the
+        # web certificate must live there even though every other RecipeMate
+        # resource is us-east-2. ``DnsValidatedCertificate`` is deprecated in
+        # newer aws-cdk-lib, but in the pinned 2.144.0 it is the pragmatic way
+        # to issue a cross-region (us-east-1 cert from this us-east-2 stack)
+        # certificate from a single stack: its ``region`` parameter provisions
+        # the cert in us-east-1 via a custom resource. DNS validation (records
+        # written into ``zone``) gives automatic certificate renewal.
+        web_certificate = acm.DnsValidatedCertificate(
+            self,
+            "WebCertificate",
+            domain_name=domain_name,
+            subject_alternative_names=[www_domain],
+            hosted_zone=zone,
+            region="us-east-1",
+            validation=acm.CertificateValidation.from_dns(zone),
+        )
+
+        # ------------------------------------------------------------------ #
         # CloudFront Origin Access Control + Distribution                     #
         # ------------------------------------------------------------------ #
         # S3Origin wires the bucket to CloudFront and provisions an Origin
@@ -116,6 +161,10 @@ class WebStack(Stack):
         self._distribution = cloudfront.Distribution(
             self,
             "WebDistribution",
+            # Serve the SPA from the apex and www aliases using the us-east-1
+            # certificate issued above.
+            domain_names=[domain_name, www_domain],
+            certificate=web_certificate,
             # Serve index.html when the viewer requests the distribution root.
             default_root_object="index.html",
             default_behavior=cloudfront.BehaviorOptions(
@@ -149,6 +198,44 @@ class WebStack(Stack):
             # Enforce modern TLS at the distribution level.
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
             comment=f"{self.stack_name} — web client SPA",
+        )
+
+        # ------------------------------------------------------------------ #
+        # OR-9 — Route 53 alias records (apex + www -> CloudFront)            #
+        # ------------------------------------------------------------------ #
+        # A + AAAA alias records so both IPv4 and IPv6 viewers resolve the apex
+        # and www names to the distribution. ``record_name=None`` targets the
+        # zone apex; ``"www"`` is relative to the zone, i.e. ``www.<domain>``.
+        cloudfront_target = route53.RecordTarget.from_alias(
+            targets.CloudFrontTarget(self._distribution)
+        )
+        route53.ARecord(
+            self,
+            "ApexAliasRecord",
+            zone=zone,
+            record_name=None,
+            target=cloudfront_target,
+        )
+        route53.AaaaRecord(
+            self,
+            "ApexAliasRecordAaaa",
+            zone=zone,
+            record_name=None,
+            target=cloudfront_target,
+        )
+        route53.ARecord(
+            self,
+            "WwwAliasRecord",
+            zone=zone,
+            record_name="www",
+            target=cloudfront_target,
+        )
+        route53.AaaaRecord(
+            self,
+            "WwwAliasRecordAaaa",
+            zone=zone,
+            record_name="www",
+            target=cloudfront_target,
         )
 
         # ------------------------------------------------------------------ #
@@ -267,6 +354,13 @@ class WebStack(Stack):
                 "IAM role ARN for CI frontend deploys — store as the "
                 "AWS_DEPLOY_ROLE_ARN GitHub secret"
             ),
+        )
+
+        cdk.CfnOutput(
+            self,
+            "SiteUrl",
+            value=f"https://{domain_name}",
+            description="Primary web client URL served over the custom domain",
         )
 
     # ---------------------------------------------------------------------- #
