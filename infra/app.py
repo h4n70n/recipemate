@@ -7,11 +7,12 @@ APP_ENV environment variable.  Supported values: staging, prod.
 
 Per-environment settings (account, region, DB/cache sizing, API scaling,
 removal-policy hint) live in ``infra/config.py``.  Values the existing stacks
-already read from CDK context — ``multiAz`` (DatabaseStack) and
-``redisNodeType`` (CacheStack) — are injected onto the app's context here so
-the stacks pick them up without any constructor changes.  Settings the stacks
-do not yet consume (``apiDesiredCount``, ``removalPolicy``) are also published
-to context so they are available for future wiring and are documented below.
+already read from CDK context (``multiAz`` for DatabaseStack,
+``redisNodeType`` for CacheStack, and ``apiDesiredCount`` for ApiStack's
+Fargate service and the OR-6 below-desired alarm) are injected onto the app's
+context here so the stacks pick them up without any constructor changes.  One
+setting the stacks do not yet consume (``removalPolicy``) is also published to
+context so it is available for future wiring and is documented below.
 
 OR-9 (Domain & DNS: recipemate.me via Route 53) adds the following context
 keys, published here so WebStack / ApiStack / AuthStack read them uniformly via
