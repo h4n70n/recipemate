@@ -175,19 +175,105 @@ LLM endpoints are protected per-user; verified with a load test.
 alarms and no alerting topic.
 
 Tasks:
-- [ ] Create an alerting SNS topic (email/Slack subscription) — distinct from the
-      APNs notifications topic.
-- [ ] ECS: alarms on service CPU/memory high, running task count < desired.
-- [ ] ALB: alarms on 5xx rate, unhealthy host count, target response time p95.
-- [ ] API Gateway: alarms on 5xx, p99 latency, throttle count.
-- [ ] RDS: CPU, free storage, connection count, replica/failover (prod multi-AZ).
-- [ ] SQS extraction: DLQ depth > 0, queue age-of-oldest-message.
-- [ ] Lambda extraction: error rate, throttles, duration near timeout (120s).
-- [ ] Redis: evictions, memory, CPU.
-- [ ] A CloudWatch dashboard summarizing the above.
+- [x] Create an alerting SNS topic (email/Slack subscription) distinct from the
+      APNs notifications topic. Topic is created; the subscription is
+      context-driven (`-c alertEmail` / `-c alertSlackWebhookUrl`) and the live
+      confirm step is operator-only (see "Remaining operator actions").
+- [x] ECS: alarms on service CPU/memory high, running task count < desired.
+- [x] ALB: alarms on 5xx rate, unhealthy host count, target response time p95.
+- [~] API Gateway: alarms on 5xx and p99 latency done. Throttle count has NO
+      per-API metric on HTTP API v2; a 4xx ClientError proxy stands in (see
+      "As implemented").
+- [x] RDS: CPU, free storage, connection count. Replica/failover (prod multi-AZ)
+      has no clean standard metric at the pin; a prod/multi-AZ-gated tighter CPU
+      alarm stands in (see "As implemented").
+- [x] SQS extraction: DLQ depth > 0, queue age-of-oldest-message.
+- [x] Lambda extraction: error rate, throttles, duration near timeout (120s).
+- [x] Redis: evictions, memory, CPU.
+- [x] A CloudWatch dashboard summarizing the above.
+
+**As implemented:**
+- A dedicated central `MonitoringStack`
+  (`infra/stacks/monitoring_stack.py`, wired in `infra/app.py` as
+  `RecipeMate-<Env>-Monitoring` after the Api/Database/Queue/Cache stacks it
+  observes) owns all alarms, one alerting SNS topic, and the dashboard. A
+  central stack was chosen over inline-per-stack alarms because it matches the
+  project's one-concern-per-stack style and because OR-6 calls for a single
+  alerting topic and a single dashboard spanning every tier.
+- The alerting topic is a **brand-new topic, DISTINCT from the APNs
+  notifications topic**. The notifications topic is never created in `infra/`:
+  it is referenced only by ARN via the `snsNotificationsTopicArn` context key
+  and surfaced to the DLQ Lambda as `SNS_NOTIFICATIONS_TOPIC_ARN`. Operator
+  alerting and end-user push are separate concerns, so they use separate
+  topics. The subscription endpoint is context-driven via `-c alertEmail` and
+  `-c alertSlackWebhookUrl` (see `docs/configuration.md`); with neither set the
+  topic is created with no subscription and a note is emitted, so synth never
+  crashes and no real email is hardcoded.
+- Every alarm fires a `cwa.SnsAction` to the alerting topic on BOTH the ALARM
+  and OK transitions so recovery is visible as well as onset. Per-tier set:
+  - **ECS**: CPU high (>= 85%), memory high (>= 85%), running task count below
+    the desired count (from `apiDesiredCount`, fallback 1, read from Container
+    Insights with treat-missing-as-breaching so a fully-down service pages).
+  - **ALB**: load-balancer + target 5xx sum (> 10 in 5 min via a
+    `MathExpression`), unhealthy host count (>= 1), p95 target response time
+    (> 2 s).
+  - **API Gateway**: 5xx (`metric_server_error` > 5), p99 latency (> 3000 ms),
+    and a 4xx `ClientError` proxy (> 50) standing in for the throttle-count
+    requirement.
+  - **RDS**: CPU (> 80%), free storage (< ~2 GiB, in bytes), connections
+    (> 80), plus a prod/multi-AZ-only tighter CPU alarm (> 70%).
+  - **SQS**: DLQ depth > 0 (datapoints-to-alarm 1), main-queue oldest-message
+    age > 600 s (noting the 120 s Lambda timeout and 300 s visibility timeout).
+  - **Lambda**: errors (>= 1), throttles (>= 1), p99 duration > 96000 ms
+    (~80% of the 120 s / 120000 ms `LAMBDA_TIMEOUT`).
+  - **Redis**: raw `AWS/ElastiCache` metrics dimensioned on the cluster ref for
+    evictions, `DatabaseMemoryUsagePercentage` (> 80), and
+    `EngineCPUUtilization` (> 75), because the cluster is an L1 `Cfn` construct
+    with no metric helpers.
+  Thresholds are intentionally conservative initial values to be refined once
+  real post-launch baselines exist.
+- A `cw.Dashboard` (`RecipeMate-<Env>-Monitoring-overview`) provides one pane of
+  glass: a title/env `TextWidget`, one graph row per tier, and an
+  alarm-status row covering every created alarm.
+- **Per-env gating:** the replica/failover-class RDS alarm is created ONLY for
+  prod or when the `multiAz` context key is truthy (single-AZ staging has no
+  standby to fail over to). Isolated synth confirmed staging = 20 alarms and
+  prod/multi-AZ = 21 alarms, with a subscription created only when
+  `alertEmail` / `alertSlackWebhookUrl` is set.
+- **API Gateway v2 throttle-metric limitation:** HTTP API v2 publishes NO
+  per-API `Throttle` metric (that is a REST API v1 / `AWS/ApiGateway` metric).
+  The 4xx `ClientError` alarm is a documented proxy: it includes the 429
+  responses emitted once OR-5 route throttling is live. This is why the
+  throttle-count checkbox is `[~]` rather than `[x]`.
+- **RDS Multi-AZ failover-metric absence:** at the pinned aws-cdk-lib 2.144.0
+  there is no clean standard single-instance Multi-AZ failover metric
+  (`ReplicaLag` is an Aurora/read-replica concept and there is no public
+  `FailoverTime` metric). Rather than reference a non-existent metric, the
+  prod/multi-AZ path adds a tighter CPU alarm (> 70%) as the closest standard
+  failover-health signal.
+
+**Remaining operator actions** (cannot run in this credential-free workspace):
+- [~] **Confirm the alerting subscription.** With no `-c alertEmail` /
+      `-c alertSlackWebhookUrl` context key set, the topic exists but has NO
+      subscription, so alarms fire to a topic with no endpoint. An email
+      subscription additionally requires the operator to click the AWS
+      confirmation link before any alarm is delivered.
+- [~] **Prove paging end to end with a synthetic failure.** Force a condition
+      (e.g. a forced 5xx, or push a message straight to the DLQ) and confirm the
+      page arrives. This can only be verified against a live deploy.
+
+**Validation performed (credential-free):** `py_compile` and isolated import of
+the monitoring/api stacks under `infra/.venv`, plus an isolated synth of
+`MonitoringStack` with stub observed constructs (20 alarms staging, 21
+prod/multi-AZ, 0 subscriptions and a note output when no endpoint context is
+set). A full-app synth still needs AWS credentials (VPC AZ + `HostedZone`
+lookups on other stacks); this is the documented pre-existing baseline, not a
+defect introduced here.
 
 **Done when:** Alarms exist for every tier, fire to the alerting topic, and a
-synthetic failure (e.g. forced 5xx) pages as expected.
+synthetic failure (e.g. forced 5xx) pages as expected. Remaining to prove live:
+operator subscription confirmation and the synthetic-failure paging test
+(`[~]` above).
 
 ---
 

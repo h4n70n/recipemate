@@ -49,6 +49,37 @@ This document is the reference for every environment variable read by RecipeMate
 |----------|-------------|---------|----------|-----------------|
 | SNS_NOTIFICATIONS_TOPIC_ARN | ARN of the SNS topic for push notifications. | arn:aws:sns:us-east-2:000000000000:recipemate-notifications | Yes | Create locally: aws --endpoint-url=http://localhost:4566 sns create-topic --name recipemate-notifications. APNs delivery only works in staging/prod. |
 
+### Monitoring & alerting (OR-6)
+
+`MonitoringStack` (`infra/stacks/monitoring_stack.py`) creates a **dedicated
+alerting SNS topic** for operational alarms across every tier
+(ECS/ALB/API Gateway/RDS/SQS/Lambda/Redis) plus a CloudWatch dashboard. This
+alerting topic is **separate from `SNS_NOTIFICATIONS_TOPIC_ARN`** (the APNs push
+topic above): operator alerting and end-user push are different concerns, so
+they use different topics. The APNs notifications topic is referenced only by
+ARN and is never created by CDK; the alerting topic is created fresh by
+`MonitoringStack`.
+
+The subscription endpoint is supplied via CDK context at synth/deploy time (not
+via an environment variable):
+
+- `-c alertEmail=<address>`: adds an email subscription to the alerting topic.
+- `-c alertSlackWebhookUrl=<https webhook>`: adds an HTTPS subscription that
+  POSTs the alarm payload to a Slack incoming webhook.
+
+Supply at least one for real alerting; both may be set. When **neither** is set,
+the topic is created with **no subscription** (and a note output is emitted), so
+`cdk synth` still works and no real email is ever hardcoded, but no alarm will
+be delivered until an endpoint is subscribed. An **email subscription must be
+confirmed** by clicking the link AWS emails to the address before any alarm is
+delivered.
+
+```
+cdk deploy RecipeMate-<Env>-Monitoring \
+    -c alertEmail=ops@example.com \
+    -c alertSlackWebhookUrl=https://hooks.slack.com/services/...
+```
+
 ### OpenAI
 
 | Variable | Description | Example | Required | Local dev notes |
