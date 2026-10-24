@@ -31,7 +31,11 @@ class ApiStack(Stack):
       - A VPC with public and private subnets for the ECS cluster and ALB.
       - An ECS Fargate cluster (no EC2 instances).
       - A Fargate task definition with the Flask API container (port 5000).
-      - An ECS Fargate service with auto-scaling targeting 70% CPU utilisation.
+      - An ECS Fargate service whose desired task count is read from the
+        ``apiDesiredCount`` CDK context key (1 staging / 2 prod; fallback 1),
+        with auto-scaling (min = desired count, max 4) targeting 70% CPU
+        utilisation. Sharing ``apiDesiredCount`` with MonitoringStack/OR-6
+        keeps the running count and the below-desired alarm threshold in sync.
       - An Application Load Balancer (internet-facing) in front of the service.
       - An API Gateway HTTP API that proxies all traffic to the ALB.
       - (OR-9) A regional (us-east-2) DNS-validated ACM certificate for
@@ -337,12 +341,23 @@ class ApiStack(Stack):
         # ------------------------------------------------------------------ #
         # ECS Fargate Service                                                 #
         # ------------------------------------------------------------------ #
+        # Desired task count is context-driven: app.py publishes
+        # ``apiDesiredCount`` from EnvConfig (1 for staging, 2 for prod) for
+        # exactly this purpose. We read it here, with the same documented
+        # fallback of 1 that MonitoringStack/OR-6 uses for its
+        # ``EcsRunningTasksBelowDesired`` alarm threshold, so the running
+        # service and that alarm's LESS_THAN threshold always derive from the
+        # same value and agree in every environment. (Previously this was
+        # hardcoded to 1, which left the prod alarm, keyed to 2, permanently
+        # in ALARM.)
+        desired_count: int = self.node.try_get_context("apiDesiredCount") or 1
+
         self._service = ecs.FargateService(
             self,
             "ApiService",
             cluster=self._cluster,
             task_definition=self._task_definition,
-            desired_count=1,
+            desired_count=desired_count,
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
@@ -358,8 +373,12 @@ class ApiStack(Stack):
         # ------------------------------------------------------------------ #
         # Auto-scaling — target 70% CPU utilisation                          #
         # ------------------------------------------------------------------ #
+        # ``min_capacity`` tracks the desired count so a scale-in can never
+        # drop the service below the per-env baseline (e.g. prod stays at 2),
+        # keeping it consistent with the ``EcsRunningTasksBelowDesired`` alarm
+        # threshold. ``max_capacity`` stays at 4 for burst headroom.
         scalable_target = self._service.auto_scale_task_count(
-            min_capacity=1,
+            min_capacity=desired_count,
             max_capacity=4,
         )
 

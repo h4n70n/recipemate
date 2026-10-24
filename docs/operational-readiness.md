@@ -212,8 +212,13 @@ Tasks:
 - Every alarm fires a `cwa.SnsAction` to the alerting topic on BOTH the ALARM
   and OK transitions so recovery is visible as well as onset. Per-tier set:
   - **ECS**: CPU high (>= 85%), memory high (>= 85%), running task count below
-    the desired count (from `apiDesiredCount`, fallback 1, read from Container
-    Insights with treat-missing-as-breaching so a fully-down service pages).
+    the desired count (threshold from `apiDesiredCount`, fallback 1, read from
+    Container Insights with treat-missing-as-breaching so a fully-down service
+    pages). `ApiStack` now reads the **same** `apiDesiredCount` key for the
+    Fargate service's `desired_count` and auto-scaling `min_capacity`, so the
+    running task count and this alarm's threshold always agree per env (1
+    staging / 2 prod). Previously the service was hardcoded to 1 while the prod
+    threshold was 2, which left the prod alarm permanently breaching.
   - **ALB**: load-balancer + target 5xx sum (> 10 in 5 min via a
     `MathExpression`), unhealthy host count (>= 1), p95 target response time
     (> 2 s).
@@ -266,9 +271,12 @@ Tasks:
 the monitoring/api stacks under `infra/.venv`, plus an isolated synth of
 `MonitoringStack` with stub observed constructs (20 alarms staging, 21
 prod/multi-AZ, 0 subscriptions and a note output when no endpoint context is
-set). A full-app synth still needs AWS credentials (VPC AZ + `HostedZone`
-lookups on other stacks); this is the documented pre-existing baseline, not a
-defect introduced here.
+set). A follow-up isolated synth also confirmed that the Fargate service's
+`desired_count` and the `EcsRunningTasksBelowDesired` alarm threshold now both
+resolve to `apiDesiredCount` and are equal in each env (1 staging / 2 prod). A
+full-app synth still needs AWS credentials (VPC AZ + `HostedZone` lookups on
+other stacks); this is the documented pre-existing baseline, not a defect
+introduced here.
 
 **Done when:** Alarms exist for every tier, fire to the alerting topic, and a
 synthetic failure (e.g. forced 5xx) pages as expected. Remaining to prove live:

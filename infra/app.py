@@ -81,8 +81,10 @@ cdk_env = cdk.Environment(account=config.account, region=config.region)
 #   - "multiAz"       -> DatabaseStack.multi_az                           #
 #   - "redisNodeType" -> CacheStack.cache_node_type                       #
 #                                                                         #
-# These keys are published for future wiring (not yet read by a stack):  #
-#   - "apiDesiredCount" -> intended ECS Fargate desired_count            #
+#   - "apiDesiredCount" -> ApiStack ECS Fargate desired_count AND the    #
+#       MonitoringStack/OR-6 below-desired alarm threshold (shared so     #
+#       the running service and that alarm agree in every environment)    #
+# This key is published for future wiring (not yet read by a stack):     #
 #   - "removalPolicy"   -> "destroy" (staging) / "retain" (prod) hint    #
 # ---------------------------------------------------------------------- #
 app.node.set_context("multiAz", config.db_multi_az)
