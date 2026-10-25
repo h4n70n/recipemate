@@ -7,11 +7,12 @@ APP_ENV environment variable.  Supported values: staging, prod.
 
 Per-environment settings (account, region, DB/cache sizing, API scaling,
 removal-policy hint) live in ``infra/config.py``.  Values the existing stacks
-already read from CDK context — ``multiAz`` (DatabaseStack) and
-``redisNodeType`` (CacheStack) — are injected onto the app's context here so
-the stacks pick them up without any constructor changes.  Settings the stacks
-do not yet consume (``apiDesiredCount``, ``removalPolicy``) are also published
-to context so they are available for future wiring and are documented below.
+already read from CDK context (``multiAz`` for DatabaseStack,
+``redisNodeType`` for CacheStack, and ``apiDesiredCount`` for ApiStack's
+Fargate service and the OR-6 below-desired alarm) are injected onto the app's
+context here so the stacks pick them up without any constructor changes.  One
+setting the stacks do not yet consume (``removalPolicy``) is also published to
+context so it is available for future wiring and is documented below.
 
 OR-9 (Domain & DNS: recipemate.me via Route 53) adds the following context
 keys, published here so WebStack / ApiStack / AuthStack read them uniformly via
@@ -54,6 +55,7 @@ from stacks.api_stack import ApiStack
 from stacks.auth_stack import AuthStack
 from stacks.cache_stack import CacheStack
 from stacks.database_stack import DatabaseStack
+from stacks.monitoring_stack import MonitoringStack
 from stacks.pipeline_oidc_stack import PipelineOidcStack
 from stacks.pipeline_stack import PipelineStack
 from stacks.queue_stack import QueueStack
@@ -80,8 +82,10 @@ cdk_env = cdk.Environment(account=config.account, region=config.region)
 #   - "multiAz"       -> DatabaseStack.multi_az                           #
 #   - "redisNodeType" -> CacheStack.cache_node_type                       #
 #                                                                         #
-# These keys are published for future wiring (not yet read by a stack):  #
-#   - "apiDesiredCount" -> intended ECS Fargate desired_count            #
+#   - "apiDesiredCount" -> ApiStack ECS Fargate desired_count AND the    #
+#       MonitoringStack/OR-6 below-desired alarm threshold (shared so     #
+#       the running service and that alarm agree in every environment)    #
+# This key is published for future wiring (not yet read by a stack):     #
 #   - "removalPolicy"   -> "destroy" (staging) / "retain" (prod) hint    #
 # ---------------------------------------------------------------------- #
 app.node.set_context("multiAz", config.db_multi_az)
@@ -177,6 +181,32 @@ pipeline_stack = PipelineStack(
     db_secret=database_stack.secret,
     flask_secret=secrets_stack.flask_secret,
     openai_secret=secrets_stack.openai_secret,
+)
+# OR-6 — centralised CloudWatch alarms, a single alerting SNS topic (DISTINCT
+# from the APNs notifications topic), and an operations dashboard. Instantiated
+# AFTER the stacks it observes (Api/Database/Queue/Cache) so threading their
+# constructs as keyword-only args both resolves the references AND establishes
+# the CloudFormation dependency edges, so those stacks build first. The alert
+# endpoint is context-driven: pass `-c alertEmail=ops@example.com` and/or
+# `-c alertSlackWebhookUrl=https://hooks.slack.com/...`; with neither set the
+# topic is created with no subscription (never a hardcoded real email). This
+# stack is intentionally NOT threaded into PipelineStack: it observes the
+# running resources, it is not part of the build/deploy path.
+monitoring_stack = MonitoringStack(
+    app,
+    f"{prefix}-Monitoring",
+    env=cdk_env,
+    env_name=config.name,
+    fargate_service=api_stack.service,
+    alb=api_stack.alb,
+    target_group=api_stack.target_group,
+    http_api=api_stack.api,
+    db_instance=database_stack.instance,
+    extraction_queue=queue_stack.queue,
+    extraction_dlq=queue_stack.dlq,
+    extraction_lambda=queue_stack.extraction_lambda,
+    dlq_lambda=queue_stack.dlq_lambda,
+    redis_cluster=cache_stack.redis,
 )
 
 app.synth()
