@@ -155,17 +155,98 @@ blocks promotion on failure.
 `HttpApi` has no throttling configured, and there is no WAF.
 
 Tasks:
-- [ ] Set default route throttling (burst + rate) on the HTTP API stage.
-- [ ] Add AWS WAF (managed common rules + rate-based rule) in front of
+- [x] Set default route throttling (burst + rate) on the HTTP API stage. Done in
+      `ApiStack` via the `$default` stage's `CfnStage.default_route_settings`
+      (burst 200 / rate 100 req/s by default; context-overridable).
+- [x] Add AWS WAF (managed common rules + rate-based rule) in front of
       CloudFront and/or the API — note WAF for CloudFront must be us-east-1
-      scope (CLOUDFRONT), regional WAF for the API lives in us-east-2.
-- [ ] Add per-user application-level throttling for the expensive LLM endpoints
+      scope (CLOUDFRONT), regional WAF for the API lives in us-east-2. Done:
+      TWO WebACLs — a CLOUDFRONT/us-east-1 ACL on the web distribution and a
+      REGIONAL/us-east-2 ACL on the HTTP API stage (see "As implemented").
+- [x] Add per-user application-level throttling for the expensive LLM endpoints
       (`POST /search/llm`, `POST /recipes/extract`) using the existing Redis
-      client (`app/services/redis_client.py`).
-- [ ] Return `429` with `Retry-After` and confirm clients handle it.
+      client (`app/services/redis_client.py`). Done via
+      `check_rate_limit` (fixed-window, `ratelimit:` key prefix), fail-open.
+- [x] Return `429` with `Retry-After` and confirm clients handle it. Done: both
+      endpoints return `429` + `Retry-After` (seconds) when over the per-user
+      limit; documented in `docs/api.md`. Live client-handling confirmation is
+      an operator step after first deploy (see "Remaining operator actions").
+
+**As implemented:**
+- **HTTP API stage throttling.** `ApiStack` sets default-route throttling on the
+  HTTP API's auto-created `$default` stage. At the pinned aws-cdk-lib 2.144.0
+  `HttpApiProps` exposes no throttle option for the auto-created default stage,
+  so the throttle is set on the stage's underlying L1 via
+  `CfnStage.default_route_settings` (`throttling_burst_limit` /
+  `throttling_rate_limit`). Defaults are a conservative **burst 200 / rate 100
+  req/s**, overridable via `-c apiThrottleBurst` / `-c apiThrottleRate`.
+- **Two WAF WebACLs, scope/region split (the crux).** A WebACL's scope and
+  region are dictated by what it fronts:
+  - **CLOUDFRONT / us-east-1** — the web client distribution. A WebACL attached
+    to CloudFront MUST be `scope="CLOUDFRONT"` and physically live in us-east-1
+    regardless of the us-east-2 default. It is its own stack,
+    `RecipeMate-<Env>-CloudFrontWaf` (`infra/stacks/cloudfront_waf_stack.py`),
+    instantiated in `infra/app.py` with `env=cdk.Environment(region="us-east-1")`
+    — mirroring the OR-9 us-east-1 CloudFront cert precedent. Its WebACL ARN is
+    threaded into `WebStack` as the `cloudfront_web_acl_arn` keyword arg and set
+    as the distribution's `web_acl_id` (which takes the WebACL **ARN**), with an
+    explicit `add_dependency` so the us-east-1 WebACL builds first. This is the
+    single documented us-east-1 exception to the us-east-2 default.
+  - **REGIONAL / us-east-2** — the HTTP API stage. Created inside `ApiStack` and
+    associated with the `$default` stage via `CfnWebACLAssociation`, building
+    the stage ARN (`arn:aws:apigateway:<region>::/apis/<apiId>/stages/<stage>`)
+    from the stack region + API id + stage name, with an `add_dependency` so the
+    association follows the stage.
+  Both WebACLs carry the same rule shape (shared `_build_waf_rules` helper):
+  `AWSManagedRulesCommonRuleSet` (managed common rule set, `override_action`
+  none) plus an IP rate-based rule (`aggregate_key_type="IP"`, action block) at
+  a context-driven `wafRateLimit` (default **2000** requests per source IP over
+  WAF's trailing 5-minute window). Both the ACLs and every rule have a
+  CloudWatch `visibility_config`.
+- **App-level fail-open + WAF backstop.** The per-user Redis limiter
+  (`check_rate_limit`) **fails open** on a `redis.RedisError` so a cache blip
+  cannot lock legitimate users out of the LLM endpoints. The security trade-off
+  is that the per-user limit is unenforced while Redis is down; the **WAF
+  rate-based rule is the backstop** that still throttles abusive source IPs in
+  that window.
+- **Per-endpoint limit defaults (FEAT-002, `app/config.py`):**
+  `POST /search/llm` → `RATE_LIMIT_LLM_SEARCH_MAX=20` per
+  `RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS=60` s; `POST /recipes/extract` →
+  `RATE_LIMIT_EXTRACT_MAX=10` per `RATE_LIMIT_EXTRACT_WINDOW_SECONDS=60` s. The
+  extract check runs before the DB row + SQS enqueue, so a throttled request
+  creates no row and sends no message; the search check runs before the OpenAI
+  call so a throttled request incurs no LLM spend. See `docs/configuration.md`
+  for all knobs.
+
+**Remaining operator actions** (cannot run in this credential-free workspace):
+- [~] **Confirm the WAF associations after the first deploy.** Verify (console
+      or `aws wafv2 get-web-acl-for-resource`) that the CLOUDFRONT WebACL is
+      attached to the distribution and the REGIONAL WebACL to the HTTP API
+      `$default` stage, and that clients handle `429` + `Retry-After` correctly.
+- [~] **Tune the limits post-launch with a real load test.** The throttle
+      burst/rate (200/100), the WAF rate-based limit (2000), and the per-user
+      limits (20/10 per 60 s) are conservative initial values; refine them once
+      real traffic baselines exist via `-c apiThrottleBurst/apiThrottleRate`,
+      `-c wafRateLimit`, and the `RATE_LIMIT_*` env vars.
+- [~] **WAF monthly cost.** AWS WAF bills per WebACL (~$5/mo each) plus per rule
+      (~$1/mo each) and per million requests; two WebACLs with two rules each add
+      a small fixed monthly cost to review against the launch budget.
+
+**Validation performed (credential-free):** `py_compile` and isolated import of
+the touched/added infra stacks under `infra/.venv` (`api_stack`, `web_stack`,
+`cloudfront_waf_stack`, `app.py`), proving the `wafv2` / throttling API calls
+match the 2.144.0 signatures. An **isolated `cdk synth RecipeMate-Staging-CloudFrontWaf
+--exclusively`** succeeded (it is lookup-free): it rendered the CLOUDFRONT-scoped
+WebACL in us-east-1 with the managed common rule set + rate-based rule, and the
+cross-stack ARN export consumed by `WebStack`. The full app suite stays green
+(`314 passed`). `ApiStack` and `WebStack` themselves CANNOT full-synth
+credential-free (VPC AZ lookups + `HostedZone.from_lookup`); that is the
+documented pre-existing baseline, not a regression introduced here.
 
 **Done when:** Load beyond the configured rate is throttled at the edge and the
-LLM endpoints are protected per-user; verified with a load test.
+LLM endpoints are protected per-user; verified with a load test. Remaining to
+prove live: operator confirmation of the WAF associations and a post-launch load
+test to tune the limits (`[~]` above).
 
 ---
 

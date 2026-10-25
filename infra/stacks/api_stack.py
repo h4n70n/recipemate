@@ -20,8 +20,19 @@ from aws_cdk import (
     aws_route53 as route53,
     aws_route53_targets as targets,
     aws_secretsmanager as secretsmanager,
+    aws_wafv2 as wafv2,
 )
 from constructs import Construct
+
+from stacks.cloudfront_waf_stack import _build_waf_rules
+
+
+#: Documented defaults for the HTTP API default-route throttling. Conservative
+#: initial values (steady-state rate + short-burst allowance) to be tuned
+#: post-launch with a real load test. Overridable via the ``apiThrottleRate`` /
+#: ``apiThrottleBurst`` CDK context keys.
+DEFAULT_API_THROTTLE_RATE = 100
+DEFAULT_API_THROTTLE_BURST = 200
 
 
 class ApiStack(Stack):
@@ -38,6 +49,24 @@ class ApiStack(Stack):
         keeps the running count and the below-desired alarm threshold in sync.
       - An Application Load Balancer (internet-facing) in front of the service.
       - An API Gateway HTTP API that proxies all traffic to the ALB.
+      - (OR-5) Default-route throttling (burst + steady-state rate) on the HTTP
+        API's auto-created ``$default`` stage. At the pinned aws-cdk-lib
+        2.144.0, ``HttpApiProps`` exposes no throttle option for the
+        auto-created default stage, so the throttle is set on the stage's
+        underlying L1 ``CfnStage.default_route_settings``. Burst/rate are
+        context-driven (``apiThrottleBurst`` / ``apiThrottleRate``) with
+        documented defaults.
+      - (OR-5) A **REGIONAL** (us-east-2) ``wafv2.CfnWebACL`` — AWS managed
+        common rule set + an IP rate-based rule — associated with the HTTP API
+        ``$default`` stage via ``CfnWebACLAssociation``. The REGIONAL scope and
+        us-east-2 region are required for a WAF fronting a regional API Gateway
+        stage. (Contrast the CloudFront-fronting WebACL, which MUST be
+        ``scope="CLOUDFRONT"`` in us-east-1 — see
+        :class:`~stacks.cloudfront_waf_stack.CloudFrontWafStack` and
+        :class:`~stacks.web_stack.WebStack`.) The rate-based limit is
+        context-driven (``wafRateLimit``) with a documented default and is the
+        edge backstop for the app-level per-user limiter, which fails open on a
+        Redis outage.
       - (OR-9) A regional (us-east-2) DNS-validated ACM certificate for
         ``api.recipemate.me``, an API Gateway v2 custom ``DomainName`` wired as
         the HTTP API's default domain mapping, and a Route 53 A alias record
@@ -52,6 +81,8 @@ class ApiStack(Stack):
       - ``cluster``         – the ECS Cluster.
       - ``service``         – the ECS FargateService.
       - ``api``             – the API Gateway HttpApi.
+      - ``api_web_acl``     – the REGIONAL (us-east-2) WAF WebACL associated
+        with the HTTP API stage (OR-5).
       - ``alb``             – the Application Load Balancer fronting the
         service (consumed by MonitoringStack/OR-6 for the ELB 5xx alarm).
       - ``target_group``    – the ALB target group holding the Fargate tasks
@@ -516,8 +547,86 @@ class ApiStack(Stack):
         )
 
         # ------------------------------------------------------------------ #
+        # OR-5 — Default-route throttling on the $default stage               #
+        # ------------------------------------------------------------------ #
+        # HttpApi auto-creates a ``$default`` stage, and at aws-cdk-lib 2.144.0
+        # HttpApiProps offers no throttle knob for it. Set the throttle on the
+        # stage's underlying L1 CfnStage via ``default_route_settings`` instead.
+        # Burst/rate are context-driven with conservative documented defaults.
+        throttle_rate = (
+            self.node.try_get_context("apiThrottleRate")
+            or DEFAULT_API_THROTTLE_RATE
+        )
+        throttle_burst = (
+            self.node.try_get_context("apiThrottleBurst")
+            or DEFAULT_API_THROTTLE_BURST
+        )
+        cfn_stage: apigwv2.CfnStage = (
+            self._api.default_stage.node.default_child
+        )
+        cfn_stage.default_route_settings = (
+            apigwv2.CfnStage.RouteSettingsProperty(
+                throttling_burst_limit=int(throttle_burst),
+                throttling_rate_limit=float(throttle_rate),
+            )
+        )
+
+        # ------------------------------------------------------------------ #
+        # OR-5 — REGIONAL (us-east-2) WAF WebACL + stage association          #
+        # ------------------------------------------------------------------ #
+        # A REGIONAL-scoped WebACL protects the regional API Gateway stage. It
+        # shares its rule shape (AWS managed common set + IP rate-based rule)
+        # with the CLOUDFRONT WebACL via the shared ``_build_waf_rules`` helper.
+        waf_rate_limit = int(
+            self.node.try_get_context("wafRateLimit") or 2000
+        )
+        self._api_web_acl = wafv2.CfnWebACL(
+            self,
+            "ApiWebAcl",
+            scope="REGIONAL",
+            default_action=wafv2.CfnWebACL.DefaultActionProperty(
+                allow=wafv2.CfnWebACL.AllowActionProperty()
+            ),
+            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                cloud_watch_metrics_enabled=True,
+                sampled_requests_enabled=True,
+                metric_name=f"{self.stack_name}-api-webacl",
+            ),
+            rules=_build_waf_rules(f"{self.stack_name}-api", waf_rate_limit),
+        )
+
+        # Associate the WebACL with the HTTP API's $default stage. The resource
+        # ARN for an API Gateway v2 HTTP API stage has the shape
+        # ``arn:aws:apigateway:<region>::/apis/<apiId>/stages/<stageName>``;
+        # build it from this stack's region, the API id, and the stage name.
+        stage_name = self._api.default_stage.stage_name
+        stage_arn = (
+            f"arn:aws:apigateway:{self.region}::/apis/"
+            f"{self._api.api_id}/stages/{stage_name}"
+        )
+        waf_association = wafv2.CfnWebACLAssociation(
+            self,
+            "ApiWebAclAssociation",
+            resource_arn=stage_arn,
+            web_acl_arn=self._api_web_acl.attr_arn,
+        )
+        # The stage must exist before WAF can associate with it; make the
+        # ordering explicit (the ARN is a plain string, so no implicit edge).
+        waf_association.node.add_dependency(self._api.default_stage)
+
+        # ------------------------------------------------------------------ #
         # CloudFormation Outputs                                              #
         # ------------------------------------------------------------------ #
+        cdk.CfnOutput(
+            self,
+            "ApiWebAclArn",
+            value=self._api_web_acl.attr_arn,
+            description=(
+                "REGIONAL (us-east-2) WAF WebACL ARN associated with the HTTP "
+                "API $default stage (OR-5)"
+            ),
+        )
+
         cdk.CfnOutput(
             self,
             "EcrRepositoryUri",
@@ -576,6 +685,11 @@ class ApiStack(Stack):
     def api(self) -> apigwv2.HttpApi:
         """The API Gateway HTTP API fronting the Fargate service."""
         return self._api
+
+    @property
+    def api_web_acl(self) -> wafv2.CfnWebACL:
+        """The REGIONAL (us-east-2) WAF WebACL fronting the HTTP API stage (OR-5)."""
+        return self._api_web_acl
 
     @property
     def alb(self) -> elbv2.ApplicationLoadBalancer:
