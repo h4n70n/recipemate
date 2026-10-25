@@ -19,6 +19,18 @@ re-created), a DNS-validated ACM certificate for ``recipemate.me`` +
 us-east-1 certs), the distribution gets ``domain_names`` + that certificate, and
 Route 53 A + AAAA alias records for the apex and ``www`` point at the
 distribution. DNS validation gives automatic certificate renewal.
+
+OR-5 (Rate limits / WAF) attaches a CLOUDFRONT-scoped AWS WAF WebACL to the
+distribution. CloudFront's ``web_acl_id`` property takes the WebACL **ARN** and,
+because the distribution is a global resource, the WebACL it references MUST be
+``scope="CLOUDFRONT"`` and MUST live in **us-east-1** (the same cross-region
+rule as the OR-9 CloudFront cert, and the single documented us-east-1 exception
+to the us-east-2 default). That WebACL is defined in its own us-east-1 stack
+(:class:`~stacks.cloudfront_waf_stack.CloudFrontWafStack`); its ARN is threaded
+into this stack as the ``cloudfront_web_acl_arn`` keyword arg by ``infra/app.py``
+and set as the distribution's ``web_acl_id``. The arg is optional so synth still
+works when absent. (The REGIONAL WebACL that fronts the API Gateway stage is a
+separate us-east-2 ACL owned by :class:`~stacks.api_stack.ApiStack`.)
 """
 from __future__ import annotations
 
@@ -50,7 +62,9 @@ class WebStack(Stack):
         StorageStack). It serves ``index.html`` as the default root object,
         redirects HTTP->HTTPS, applies Price Class 100 (US & Europe), and
         enforces TLS 1.2_2021. 403 and 404 responses are rewritten to
-        ``/index.html`` with status 200 so client-side routes deep-link.
+        ``/index.html`` with status 200 so client-side routes deep-link. When a
+        ``cloudfront_web_acl_arn`` is supplied (OR-5), the distribution's
+        ``web_acl_id`` is set to that us-east-1 CLOUDFRONT-scoped WAF WebACL.
       - A least-privilege frontend deploy role trusted only by this repo on
         ``main`` via GitHub OIDC. It imports the OIDC provider owned by
         PipelineOidcStack (never creating a second one) and is scoped to just
@@ -77,8 +91,20 @@ class WebStack(Stack):
     #: so synth never crashes when the optional context is absent.
     DEFAULT_GITHUB_REPO: str = "your-org/recipemate"
 
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        id: str,
+        *,
+        cloudfront_web_acl_arn: str | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(scope, id, **kwargs)
+        # OR-5: ARN of the CLOUDFRONT-scoped WAF WebACL (us-east-1) to attach to
+        # the distribution. Threaded in from CloudFrontWafStack via app.py. Kept
+        # optional so synth still works when absent (``web_acl_id`` is only set
+        # when provided — see the distribution below).
+        self._cloudfront_web_acl_arn = cloudfront_web_acl_arn
 
         # ------------------------------------------------------------------ #
         # Removal policy — honour the per-env context hint published by      #
@@ -197,6 +223,12 @@ class WebStack(Stack):
             price_class=cloudfront.PriceClass.PRICE_CLASS_100,
             # Enforce modern TLS at the distribution level.
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+            # OR-5: attach the CLOUDFRONT-scoped WAF WebACL (us-east-1). The
+            # property is named ``web_acl_id`` but takes the WebACL **ARN**, and
+            # a distribution can only reference a CLOUDFRONT-scoped WebACL that
+            # lives in us-east-1 (see CloudFrontWafStack / module docstring).
+            # Only set when provided so synth still works when the ARN is absent.
+            web_acl_id=self._cloudfront_web_acl_arn,
             comment=f"{self.stack_name} — web client SPA",
         )
 

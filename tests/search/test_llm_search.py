@@ -45,11 +45,20 @@ from app.services import llm_search, redis_client
 
 
 class _FakeRedis:
-    """Minimal in-memory stand-in for a redis-py client (get/set + TTL)."""
+    """Minimal in-memory stand-in for a redis-py client.
+
+    Covers both the LLM-search cache surface (``get``/``set`` with TTL) and the
+    rate-limiter surface (``incr``/``expire``/``ttl``) the ``/search/llm`` view
+    now exercises on every request. The default limits are generous, so these
+    tests never trip the limiter; the limiter is covered on its own in
+    :mod:`tests.services.test_rate_limit` and
+    :mod:`tests.search.test_llm_search_rate_limit`.
+    """
 
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
+        self.counts: dict[str, int] = {}
 
     def get(self, key: str):
         return self.store.get(key)
@@ -59,6 +68,19 @@ class _FakeRedis:
         if ex is not None:
             self.ttls[key] = ex
         return True
+
+    def incr(self, key: str) -> int:
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return self.counts[key]
+
+    def expire(self, key: str, seconds: int) -> bool:
+        self.ttls[key] = seconds
+        return True
+
+    def ttl(self, key: str) -> int:
+        if key not in self.counts:
+            return -2
+        return self.ttls.get(key, -1)
 
 
 def _auth_headers() -> dict[str, str]:

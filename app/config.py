@@ -68,6 +68,28 @@ class Config:
     # Redis
     REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
+    # Per-user application-level rate limits for the two expensive LLM
+    # endpoints (see app.services.redis_client.check_rate_limit). Each is a
+    # fixed-window "<MAX> requests per <WINDOW> seconds, per user" limit,
+    # enforced via Redis and failing OPEN on a cache outage. Defaults are
+    # deliberately low because each call fans out to an LLM / extraction job
+    # (OpenAI for /search/llm, an SQS-backed extraction worker for
+    # /recipes/extract): generous enough for normal interactive use, tight
+    # enough to cap per-user spend and abuse. Override via the matching env
+    # vars; values are coerced to int.
+    RATE_LIMIT_LLM_SEARCH_MAX: int = int(
+        os.environ.get("RATE_LIMIT_LLM_SEARCH_MAX", "20")
+    )
+    RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS: int = int(
+        os.environ.get("RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS", "60")
+    )
+    RATE_LIMIT_EXTRACT_MAX: int = int(
+        os.environ.get("RATE_LIMIT_EXTRACT_MAX", "10")
+    )
+    RATE_LIMIT_EXTRACT_WINDOW_SECONDS: int = int(
+        os.environ.get("RATE_LIMIT_EXTRACT_WINDOW_SECONDS", "60")
+    )
+
     # AWS
     AWS_REGION: str = os.environ.get("AWS_REGION", "us-east-2")
     S3_BUCKET: str = os.environ.get("S3_BUCKET", "recipemate-images")

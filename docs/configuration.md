@@ -20,7 +20,7 @@ This document is the reference for every environment variable read by RecipeMate
 
 | Variable | Description | Example | Required | Local dev notes |
 |----------|-------------|---------|----------|-----------------|
-| REDIS_URL | Redis connection string. Used for search result caching and upload metadata. | redis://redis:6379/0 | Yes | Default points at the redis Docker Compose service. |
+| REDIS_URL | Redis connection string. Used for search result caching, upload metadata, and the per-user rate limiter (OR-5). | redis://redis:6379/0 | Yes | Default points at the redis Docker Compose service. |
 
 ### AWS — General
 
@@ -79,6 +79,68 @@ cdk deploy RecipeMate-<Env>-Monitoring \
     -c alertEmail=ops@example.com \
     -c alertSlackWebhookUrl=https://hooks.slack.com/services/...
 ```
+
+### Rate limiting & WAF (OR-5)
+
+RecipeMate throttles abusive traffic at two layers: a per-user application-level
+rate limiter on the two expensive LLM endpoints, and AWS WAF at the edge.
+
+**App-level per-user limits.** `app/services/redis_client.check_rate_limit`
+applies a Redis fixed-window counter (`ratelimit:<scope>:<user_id>`) in front of
+`POST /search/llm` and `POST /recipes/extract`. Over-limit requests get `429`
+with a `Retry-After` header (seconds until the window resets). The defaults are
+deliberately low because each call fans out to an LLM / extraction worker; tune
+per environment via these env vars (read in `app/config.py`, coerced to int):
+
+| Variable | Description | Default | Endpoint |
+|----------|-------------|---------|----------|
+| RATE_LIMIT_LLM_SEARCH_MAX | Max `POST /search/llm` requests per window, per user. | 20 | `/search/llm` |
+| RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS | Window length for `/search/llm`, seconds. | 60 | `/search/llm` |
+| RATE_LIMIT_EXTRACT_MAX | Max `POST /recipes/extract` requests per window, per user. | 10 | `/recipes/extract` |
+| RATE_LIMIT_EXTRACT_WINDOW_SECONDS | Window length for `/recipes/extract`, seconds. | 60 | `/recipes/extract` |
+
+**Fail-open behavior.** The limiter is best-effort and **fails open**: if Redis
+is unreachable (connection refused, timeout, DNS failure) the check logs a
+warning and allows the request rather than locking legitimate users out over a
+transient cache blip. The trade-off is that the per-user limit is not enforced
+while Redis is down — the AWS WAF rate-based rule (below) is the backstop that
+still throttles abusive source IPs in that window.
+
+**AWS WAF — scope/region split.** WAF is applied at both edges, and the two
+WebACLs MUST differ in scope and region because of AWS constraints:
+
+- **CloudFront (web client):** a `scope="CLOUDFRONT"` WebACL that MUST live in
+  **us-east-1** regardless of the us-east-2 default (the same cross-region rule
+  as the OR-9 CloudFront ACM cert, and the single documented us-east-1
+  exception). It is its own stack, `RecipeMate-<Env>-CloudFrontWaf`
+  (`infra/stacks/cloudfront_waf_stack.py`), instantiated in `infra/app.py` with
+  `env.region="us-east-1"`; its WebACL ARN is threaded into `WebStack` as the
+  `cloudfront_web_acl_arn` keyword arg and set as the distribution's
+  `web_acl_id` (which takes the WebACL **ARN** despite its name).
+- **API Gateway (backend):** a `scope="REGIONAL"` WebACL in **us-east-2**,
+  created inside `ApiStack` and associated with the HTTP API `$default` stage
+  via `CfnWebACLAssociation`.
+
+Both WebACLs carry the same rule shape: the AWS managed `AWSManagedRulesCommonRuleSet`
+plus an IP rate-based rule (`aggregate_key_type="IP"`) that blocks a source IP
+exceeding the limit over WAF's trailing 5-minute window.
+
+**New CDK context keys (all optional, with documented defaults):**
+
+| Context key | Description | Default |
+|-------------|-------------|---------|
+| `apiThrottleRate` | HTTP API `$default`-stage steady-state throttle (req/s) set on the stage's `CfnStage.default_route_settings`. | 100 |
+| `apiThrottleBurst` | HTTP API `$default`-stage burst throttle. | 200 |
+| `wafRateLimit` | Per-source-IP limit for the WAF rate-based rule (trailing 5-min window), shared by BOTH WebACLs. WAF minimum is 100. | 2000 |
+
+```
+cdk deploy RecipeMate-<Env>-Api RecipeMate-<Env>-Web RecipeMate-<Env>-CloudFrontWaf \
+    -c apiThrottleRate=100 -c apiThrottleBurst=200 -c wafRateLimit=2000
+```
+
+The CLOUDFRONT WebACL ARN is wired stack-to-stack (no context key needed): the
+`CloudFrontWafStack` ARN flows into `WebStack` automatically, with an explicit
+`add_dependency` so the us-east-1 WebACL is created before the distribution.
 
 ### OpenAI
 

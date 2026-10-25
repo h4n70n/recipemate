@@ -32,7 +32,7 @@ Heuristic design notes (``GET /search``)
 
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from pydantic import ValidationError
 from sqlalchemy import func
 
@@ -40,7 +40,7 @@ from app.auth import current_user, require_auth
 from app.models.recipe import Ingredient, Recipe, RecipeTag, Tag, Tool
 from app.schemas.recipe import RecipeCard, RecipeListResponse
 from app.schemas.search import LlmSearchRequest, SearchQuery
-from app.services import llm_search
+from app.services import llm_search, redis_client
 from app.services.urls import s3_key_to_url
 
 search_bp = Blueprint("search", __name__, url_prefix="/v1/search")
@@ -264,14 +264,39 @@ def llm_search_view():
     Validation errors (missing/empty ``query``, over-length, unknown fields)
     are rejected with HTTP 400 and a concise ``{"error": <message>}`` body.
 
+    Rate limiting
+    -------------
+    Because each accepted request can fan out to the LLM, the endpoint is
+    protected by a per-user fixed-window limit
+    (``RATE_LIMIT_LLM_SEARCH_MAX`` requests per
+    ``RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS``). Once exceeded the view returns
+    429 with a ``Retry-After`` header; the limiter fails open on a Redis
+    outage. The check runs *after* validation but *before* the LLM search so a
+    throttled request never reaches the model.
+
     Returns:
         JSON ``{"recipes": [<card with match_explanation>, ...]}`` with HTTP
-        200. The order of ``recipes`` is the match ranking (best first).
+        200. The order of ``recipes`` is the match ranking (best first). HTTP
+        429 with ``{"error": ...}`` and a ``Retry-After`` header when the
+        per-user limit is exceeded.
     """
     try:
         payload = LlmSearchRequest.model_validate(request.get_json(silent=True) or {})
     except ValidationError as error:
         return jsonify({"error": _validation_error_message(error)}), 400
+
+    rate = redis_client.check_rate_limit(
+        "search_llm",
+        current_user.id,
+        current_app.config["RATE_LIMIT_LLM_SEARCH_MAX"],
+        current_app.config["RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS"],
+    )
+    if not rate.allowed:
+        return (
+            jsonify({"error": "Rate limit exceeded; please retry later"}),
+            429,
+            {"Retry-After": str(rate.retry_after)},
+        )
 
     response = llm_search.search_recipes(current_user.id, payload.query)
     return jsonify(response), 200

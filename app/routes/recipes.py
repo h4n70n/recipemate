@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime
 import logging
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
@@ -297,15 +297,40 @@ def extract_recipe():
     caller the recipe owner. The uploaded key is opaque/unguessable (a uuid
     segment), so this is an acceptable trade-off.
 
+    Rate limiting
+    -------------
+    A per-user fixed-window limit (``RATE_LIMIT_EXTRACT_MAX`` requests per
+    ``RATE_LIMIT_EXTRACT_WINDOW_SECONDS``) is enforced *before* the recipe row
+    is created and the job enqueued, so a throttled request creates no row and
+    sends no message. Over-limit returns 429 with a ``Retry-After`` header; the
+    limiter fails open on a Redis outage.
+
     Returns:
         JSON ``{"recipe_id": "<uuid>", "extraction_status": "pending"}`` with
-        HTTP 201, or ``{"error": ...}`` with 400 (validation) / 503 (enqueue
-        failure).
+        HTTP 201, or ``{"error": ...}`` with 400 (validation) / 429 (rate
+        limit, with ``Retry-After``) / 503 (enqueue failure).
     """
     try:
         payload = ExtractRequest.model_validate(request.get_json(silent=True) or {})
     except ValidationError as error:
         return jsonify({"error": _validation_error_message(error)}), 400
+
+    # Per-user rate limit runs BEFORE creating the recipe or enqueueing, so a
+    # throttled request leaves no ``pending`` row behind and sends no SQS
+    # message. Extraction is expensive (async OCR/LLM worker), so the limit is
+    # tighter than ordinary reads. The limiter fails open on a Redis outage.
+    rate = redis_client.check_rate_limit(
+        "extract",
+        current_user.id,
+        current_app.config["RATE_LIMIT_EXTRACT_MAX"],
+        current_app.config["RATE_LIMIT_EXTRACT_WINDOW_SECONDS"],
+    )
+    if not rate.allowed:
+        return (
+            jsonify({"error": "Rate limit exceeded; please retry later"}),
+            429,
+            {"Retry-After": str(rate.retry_after)},
+        )
 
     recipe = Recipe(
         user_id=current_user.id,

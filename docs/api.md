@@ -87,6 +87,13 @@ Request body: `{"s3_key": "uploads/uuid/photo.jpg", "origin": "instagram", "sour
 
 Response: `{"recipe_id": "<uuid>", "extraction_status": "pending"}` (201).
 
+Rate limited per user (OR-5): a throttled request returns `429` with a
+`Retry-After` header (seconds to wait) and `{"error": ...}`, and creates no
+recipe row and enqueues no extraction job. Default limit is 10 requests per 60 s
+per user (`RATE_LIMIT_EXTRACT_MAX` / `RATE_LIMIT_EXTRACT_WINDOW_SECONDS`, see
+`docs/configuration.md`). The limiter fails open if Redis is unavailable; the
+edge AWS WAF rate-based rule is the backstop.
+
 ### GET /recipes/{id}/extraction-status
 
 Auth required. Poll extraction progress.
@@ -199,6 +206,14 @@ Request body: `{"query": "I have chicken thighs, garlic, and a lemon"}`
 Response: `{"recipes": [{id, title, thumbnail_url, match_explanation, ...}]}`
 
 Falls back to heuristic search if LLM call fails.
+
+Rate limited per user (OR-5): a throttled request returns `429` with a
+`Retry-After` header (seconds to wait) and `{"error": ...}`, checked before the
+LLM call so an over-limit request incurs no OpenAI spend. Default limit is 20
+requests per 60 s per user (`RATE_LIMIT_LLM_SEARCH_MAX` /
+`RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS`, see `docs/configuration.md`). The
+limiter fails open if Redis is unavailable; the edge AWS WAF rate-based rule is
+the backstop.
 
 ## System
 

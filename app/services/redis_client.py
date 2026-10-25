@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import NamedTuple
 
 import redis
 from flask import current_app
@@ -37,6 +38,38 @@ logger = logging.getLogger(__name__)
 
 #: Prefix for upload-metadata keys: ``upload:<s3_key>``.
 _KEY_PREFIX = "upload:"
+
+#: Prefix for per-user rate-limit counters: ``ratelimit:<scope>:<user_id>``.
+#: Kept distinct from ``upload:`` so the two concerns never share a key space.
+_RATE_LIMIT_PREFIX = "ratelimit:"
+
+
+class RateLimitResult(NamedTuple):
+    """Outcome of a :func:`check_rate_limit` call.
+
+    Attributes:
+        allowed: ``True`` if the request may proceed, ``False`` if the caller
+            has exceeded the window's limit. Also ``True`` whenever Redis is
+            unavailable (the limiter fails open — see :func:`check_rate_limit`).
+        retry_after: Seconds the caller should wait before retrying, derived
+            from the counter key's remaining TTL and floored at 1 so a
+            ``Retry-After`` header is never 0 or negative. When the over-limit
+            branch self-heals a lost TTL (see :func:`check_rate_limit`) this is
+            the full ``window_seconds``. ``0`` when the request was allowed.
+    """
+
+    allowed: bool
+    retry_after: int
+
+
+def _rate_limit_key(scope: str, user_id: object) -> str:
+    """Return the namespaced Redis key for a per-user rate-limit counter.
+
+    ``scope`` names the limited operation (e.g. ``"search_llm"`` or
+    ``"extract"``) so each endpoint's counter is independent; ``user_id`` is
+    stringified so a UUID serialises cleanly.
+    """
+    return f"{_RATE_LIMIT_PREFIX}{scope}:{user_id}"
 
 
 def get_redis_client():
@@ -108,3 +141,104 @@ def store_upload_metadata(
             error,
         )
         return False
+
+
+def check_rate_limit(
+    scope: str,
+    user_id: object,
+    limit: int,
+    window_seconds: int,
+) -> RateLimitResult:
+    """Apply a per-user fixed-window rate limit and report the outcome.
+
+    Implements a classic fixed-window counter keyed by
+    ``ratelimit:<scope>:<user_id>``:
+
+    * ``INCR`` the counter (which creates it at ``1`` on the first request of a
+      new window), then on that first hit (``count == 1``) set ``EXPIRE
+      window_seconds`` so the whole window — and therefore the counter — resets
+      after ``window_seconds``.
+    * The request is ``allowed`` while ``count <= limit``.
+    * When over the limit, ``retry_after`` is derived from the key's remaining
+      ``TTL`` and floored at 1 second, so a ``Retry-After`` header built from it
+      is never 0 or negative (a just-created key can momentarily report a TTL of
+      ``-1``/``-2`` between the ``INCR`` and ``EXPIRE``).
+
+    Self-healing lost TTLs
+    ----------------------
+    ``EXPIRE`` is normally issued only on the first hit of a window
+    (``count == 1``). If a counter key ever loses its expiry — e.g. an
+    ``EXPIRE`` that silently failed to land while ``INCR`` succeeded, or an
+    operational ``PERSIST`` — a fixed-window counter would never reset and the
+    user would stay wedged over the limit indefinitely while Redis is healthy.
+    To defend against that, whenever the over-limit branch observes a
+    **non-positive TTL** (``-1`` no-expiry) on the key, this re-applies
+    ``EXPIRE(key, window_seconds)`` so the window actually resets, and uses
+    ``window_seconds`` as the ``retry_after``. Any other non-positive/edge TTL
+    that is not repaired (e.g. ``-2`` for a key that vanished between ``INCR``
+    and the ``TTL`` read) still falls back to the 1-second floor.
+
+    Window semantics: the limit is ``limit`` requests per fixed ``window_seconds``
+    window that begins at the first request. All requests in that window share
+    one counter; the allowance refills in full when the window expires (not a
+    sliding/token-bucket refill).
+
+    Fail-open policy
+    ----------------
+    This limiter is **best-effort** and deliberately **fails open**: any
+    :class:`redis.RedisError` (connection refused, timeout, DNS failure) is
+    caught, logged at warning level, and results in an ``allowed=True`` result.
+    A transient cache blip must never lock legitimate users out of these
+    endpoints. The security trade-off is that while Redis is down the
+    application-level per-user limit is not enforced; the edge **AWS WAF
+    rate-based rule** (added by the OR-5 infra work) is the backstop that still
+    throttles abusive traffic in that window. Constructs its client only via
+    :func:`get_redis_client` so tests can monkeypatch the seam.
+
+    Args:
+        scope: Names the limited operation; keeps each endpoint's counter
+            independent (e.g. ``"search_llm"``, ``"extract"``).
+        user_id: The authenticated caller's id (stringified into the key).
+        limit: Maximum allowed requests per window.
+        window_seconds: Length of the fixed window in seconds.
+
+    Returns:
+        A :class:`RateLimitResult` with ``allowed`` and ``retry_after``.
+    """
+    key = _rate_limit_key(scope, user_id)
+
+    try:
+        client = get_redis_client()
+        count = client.incr(key)
+        if count == 1:
+            # First request in a new window — start the expiry clock.
+            client.expire(key, window_seconds)
+
+        if count <= limit:
+            return RateLimitResult(allowed=True, retry_after=0)
+
+        # Over the limit: tell the caller when the window resets.
+        ttl = client.ttl(key)
+        if isinstance(ttl, int) and ttl > 0:
+            retry_after = ttl
+        elif ttl == -1:
+            # The key exists but lost its expiry (TTL -1): the counter would
+            # never reset and wedge the user. Self-heal by re-applying EXPIRE
+            # so the window resets, and report the full window as retry_after.
+            client.expire(key, window_seconds)
+            retry_after = window_seconds
+        else:
+            # Any other non-positive/edge TTL (e.g. -2 for a key that vanished
+            # in the narrow gap before EXPIRE landed): floor at 1 second so a
+            # Retry-After header is never 0 or negative.
+            retry_after = 1
+        return RateLimitResult(allowed=False, retry_after=retry_after)
+    except redis.RedisError as error:
+        # Fail open: a cache outage must not block legitimate users. The edge
+        # WAF rate-based rule is the backstop while Redis is unavailable.
+        logger.warning(
+            "Rate-limit check failed for %s (allowing request): %s",
+            key,
+            error,
+        )
+        return RateLimitResult(allowed=True, retry_after=0)

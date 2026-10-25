@@ -45,6 +45,27 @@ These are context lookups, not AWS environment lookups: the placeholder
 fallbacks keep synth logic from crashing when a key is absent. (The one true
 AWS lookup OR-9 introduces is ``HostedZone.from_lookup`` inside the stacks,
 which does require account credentials at synth time.)
+
+OR-5 (Rate limits / throttling / WAF) adds these context keys and one extra
+stack. The keys all have documented defaults inside the stacks, so they are NOT
+force-published here (the defaults live where they are read); they are listed so
+operators know the overrides exist:
+
+  - ``apiThrottleRate``  -> HTTP API $default-stage steady-state throttle (req/s).
+                            Default 100 (``ApiStack.DEFAULT_API_THROTTLE_RATE``).
+  - ``apiThrottleBurst`` -> HTTP API $default-stage burst throttle. Default 200
+                            (``ApiStack.DEFAULT_API_THROTTLE_BURST``).
+  - ``wafRateLimit``     -> per-source-IP limit for the WAF rate-based rule
+                            (trailing 5-min window), shared by BOTH WebACLs.
+                            Default 2000 (``CloudFrontWafStack.DEFAULT_WAF_RATE_LIMIT``).
+
+The extra stack is ``RecipeMate-<Env>-CloudFrontWaf`` — the CLOUDFRONT-scoped
+WAF WebACL. It MUST be created in **us-east-1** (CloudFront WebACLs cannot be
+REGIONAL/us-east-2), so it is the single us-east-1 exception alongside the OR-9
+CloudFront cert. It is instantiated with ``env.region="us-east-1"`` and its
+WebACL ARN is threaded into ``WebStack`` as ``cloudfront_web_acl_arn`` (which
+sets the distribution's ``web_acl_id``). The REGIONAL (us-east-2) WebACL that
+fronts the API Gateway stage is owned by ``ApiStack`` itself.
 """
 import os
 
@@ -54,6 +75,7 @@ from config import get_env_config
 from stacks.api_stack import ApiStack
 from stacks.auth_stack import AuthStack
 from stacks.cache_stack import CacheStack
+from stacks.cloudfront_waf_stack import CloudFrontWafStack
 from stacks.database_stack import DatabaseStack
 from stacks.monitoring_stack import MonitoringStack
 from stacks.pipeline_oidc_stack import PipelineOidcStack
@@ -145,10 +167,33 @@ api_stack = ApiStack(
     openai_secret=secrets_stack.openai_secret,
     flask_secret=secrets_stack.flask_secret,
 )
+# OR-5 — CLOUDFRONT-scoped WAF WebACL. A WebACL attached to a CloudFront
+# distribution MUST be scope=CLOUDFRONT and physically live in us-east-1,
+# regardless of the us-east-2 default (the same cross-region rule as the OR-9
+# CloudFront cert, and the single documented us-east-1 exception). It is given
+# its own stack with an explicit us-east-1 environment; its WebACL ARN is
+# threaded into WebStack below, which also establishes the dependency edge so
+# WebStack builds after it.
+cloudfront_waf_stack = CloudFrontWafStack(
+    app,
+    f"{prefix}-CloudFrontWaf",
+    env=cdk.Environment(account=config.account, region="us-east-1"),
+)
 # Static hosting (S3 + CloudFront) for the Vite/React web client. The CI
 # pipeline syncs frontend/dist into this bucket and invalidates the
 # distribution; its outputs (bucket name, distribution id) feed the deploy vars.
-web_stack = WebStack(app, f"{prefix}-Web", env=cdk_env)
+# OR-5: the us-east-1 CLOUDFRONT WebACL ARN is threaded in as web_acl_id for the
+# distribution.
+web_stack = WebStack(
+    app,
+    f"{prefix}-Web",
+    env=cdk_env,
+    cloudfront_web_acl_arn=cloudfront_waf_stack.web_acl_arn,
+)
+# The ARN is a cross-region plain-string reference, so add an explicit
+# dependency to guarantee the us-east-1 WebACL is created before the
+# distribution that references it.
+web_stack.add_dependency(cloudfront_waf_stack)
 # GitHub OIDC trust + least-privilege backend deploy role so CI can run CDK,
 # push to ECR, and roll the ECS service without static AWS keys. Repo and
 # provider-creation behaviour are set via CDK context (githubRepo,
