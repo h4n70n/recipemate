@@ -99,20 +99,54 @@ def test_over_limit_is_rejected_with_retry_after(monkeypatch):
 
 
 def test_retry_after_floored_at_one_second(monkeypatch):
-    """A non-positive TTL is floored to 1 so Retry-After is never 0/negative."""
+    """A non-repairable non-positive TTL is floored to 1.
+
+    A ``-2`` TTL (the key vanished in the narrow gap before ``EXPIRE`` landed)
+    is not self-healed — there is nothing to re-expire — so ``retry_after``
+    falls back to the 1-second floor and is never 0/negative. Distinct from the
+    ``-1`` lost-expiry case, which self-heals (see
+    :func:`test_lost_ttl_self_heals_and_resets_window`).
+    """
     fake = _FakeRedis()
     monkeypatch.setattr(redis_client, "get_redis_client", lambda: fake)
 
-    # Pretend the key exists but has lost its expiry (TTL -1).
-    key = "ratelimit:search_llm:user-3"
-    fake.counts[key] = 5  # already over any small limit
-    fake.ttls[key] = -1
+    # Pretend INCR reports the caller is over the limit, but by the time we read
+    # the TTL the key has gone (ttl() returns -2 for an unknown key).
+    monkeypatch.setattr(fake, "incr", lambda key: 5)
 
     result = redis_client.check_rate_limit(
         "search_llm", "user-3", limit=1, window_seconds=60
     )
     assert result.allowed is False
     assert result.retry_after == 1
+
+
+def test_lost_ttl_self_heals_and_resets_window(monkeypatch):
+    """An over-limit key with TTL -1 (no expiry) is defensively re-expired.
+
+    Guards against the lost-TTL wedge: if a counter ever loses its expiry while
+    over the limit it would never reset and block the user indefinitely. The
+    over-limit branch must observe the ``-1`` TTL, re-apply
+    ``EXPIRE(key, window_seconds)`` so the window resets, and report
+    ``retry_after == window_seconds``.
+    """
+    fake = _FakeRedis()
+    monkeypatch.setattr(redis_client, "get_redis_client", lambda: fake)
+
+    # Seed an over-limit key that has lost its expiry (TTL -1, no expiry).
+    key = "ratelimit:search_llm:user-wedged"
+    fake.counts[key] = 5  # already over the small limit below
+    fake.ttls[key] = -1
+
+    result = redis_client.check_rate_limit(
+        "search_llm", "user-wedged", limit=1, window_seconds=90
+    )
+
+    assert result.allowed is False
+    # retry_after is the full window, not the 1-second floor.
+    assert result.retry_after == 90
+    # EXPIRE was re-applied so the window will actually reset.
+    assert fake.ttls[key] == 90
 
 
 def test_counters_are_scoped_per_endpoint_and_user(monkeypatch):

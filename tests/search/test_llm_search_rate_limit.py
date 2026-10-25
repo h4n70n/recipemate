@@ -128,7 +128,11 @@ def _stub_llm(monkeypatch):
 def test_under_limit_requests_succeed(client, app, owner_env, monkeypatch):
     app.config["RATE_LIMIT_LLM_SEARCH_MAX"] = 3
     app.config["RATE_LIMIT_LLM_SEARCH_WINDOW_SECONDS"] = 60
-    monkeypatch.setattr(redis_client, "get_redis_client", lambda: _FakeRedis())
+    # Shared fake so the counter persists across requests — otherwise this test
+    # would pass even against a limiter that never persisted its counter.
+    monkeypatch.setattr(
+        redis_client, "get_redis_client", lambda fake=_FakeRedis(): fake
+    )
     _stub_llm(monkeypatch)
 
     for i in range(3):
